@@ -1,6 +1,7 @@
 import io
 import os
-from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Iterator as PyIterator
+from typing import TYPE_CHECKING, Dict, Iterator, List, Optional
+from typing import Iterator as PyIterator
 
 # For some reason mypy doesn't think this exists
 from typing_extensions import Buffer  # type: ignore
@@ -263,7 +264,7 @@ class Client:
         """
         Returns an iterator over the statuses of files/directories matching the glob pattern.
         """
-        return self.inner.list_status_glob(pattern)
+        return iter(self.inner.list_status_glob(pattern))
 
     def delete_glob(self, pattern: str, recursive: bool = False) -> None:
         """

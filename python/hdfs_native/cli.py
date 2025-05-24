@@ -79,14 +79,13 @@ def _glob_path(client: Client, glob_pattern: str) -> List[str]:
         try:
             # This is a bit of a workaround. If it's a direct path, list_status_glob
             # will return a list containing the status of that path if it exists.
-            statuses = client.list_status_glob(glob_pattern)
-            if statuses:
-                return [status.path for status in statuses]
+            # Convert iterator to list to check if it yielded anything
+            # and to be able to reuse its contents.
+            status_list = list(client.list_status_glob(glob_pattern))
+            if status_list:  # Now check if the list is non-empty
+                return [status.path for status in status_list]
             else:
-                # If the literal path doesn't exist, list_status_glob might return empty or error.
-                # To maintain consistency with original _glob_path returning the input if not a "real" glob,
-                # we might want to check existence first, or rely on subsequent operations to fail.
-                # For now, if list_status_glob returns empty for a non-glob pattern, treat as no match.
+                # Path does not exist or list_status_glob returned empty for other reasons.
                 return []
         except FileNotFoundError:
             # If the literal path doesn't exist, list_status_glob might raise FileNotFoundError.

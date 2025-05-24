@@ -590,14 +590,17 @@ impl Client {
 
     /// Deletes the files/directories matching the glob pattern.
     pub async fn delete_glob(&self, pattern: &str, recursive: bool) -> Result<()> {
-        // Collect all delete futures
-        let mut delete_futures = Vec::new();
+        let mut paths_to_delete = Vec::new();
         for entry in glob(pattern)? {
-            let path = entry?.to_string_lossy().to_string();
-            delete_futures.push(self.delete(&path, recursive));
+            paths_to_delete.push(entry?.to_string_lossy().into_owned());
         }
 
-        // Execute all deletes in parallel and return on the first error
+        let mut delete_futures = Vec::new();
+        for path_str in &paths_to_delete {
+            // Iterate over references to strings in the Vec
+            delete_futures.push(self.delete(path_str, recursive)); // path_str is &String, coerces to &str
+        }
+
         try_join_all(delete_futures).await?;
         Ok(())
     }
@@ -613,10 +616,15 @@ impl Client {
             space_quota: 0,
         };
 
-        let mut summary_futures = Vec::new();
+        let mut paths_to_summarize = Vec::new();
         for entry in glob(pattern)? {
-            let path = entry?.to_string_lossy().to_string();
-            summary_futures.push(self.get_content_summary(path.clone()));
+            paths_to_summarize.push(entry?.to_string_lossy().into_owned());
+        }
+
+        let mut summary_futures = Vec::new();
+        for path_str in &paths_to_summarize {
+            // Iterate over references to strings in the Vec
+            summary_futures.push(self.get_content_summary(path_str)); // path_str is &String, coerces to &str
         }
 
         let summaries = try_join_all(summary_futures).await?;

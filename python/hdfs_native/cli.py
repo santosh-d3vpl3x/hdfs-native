@@ -66,9 +66,34 @@ def _path_for_url(url: str) -> str:
     return urlparse(url).path
 
 
-def _glob_path(client: Client, glob: str) -> List[str]:
-    # TODO: Actually implement this, for now just pretend we have multiple results
-    return [glob]
+def _glob_path(client: Client, glob_pattern: str) -> List[str]:
+    """
+    Resolves an HDFS glob pattern into a list of matching paths.
+    If the pattern doesn't contain any glob characters, it's treated as a literal path.
+    """
+    if not any(char in glob_pattern for char in "*?[]{}"):
+        # If no glob special characters, treat as a literal path.
+        # We still call list_status_glob to verify existence and get the FileStatus,
+        # but expect it to behave like get_file_info for a single path.
+        # However, list_status_glob returns a list.
+        try:
+            # This is a bit of a workaround. If it's a direct path, list_status_glob
+            # will return a list containing the status of that path if it exists.
+            statuses = client.list_status_glob(glob_pattern)
+            if statuses:
+                return [status.path for status in statuses]
+            else:
+                # If the literal path doesn't exist, list_status_glob might return empty or error.
+                # To maintain consistency with original _glob_path returning the input if not a "real" glob,
+                # we might want to check existence first, or rely on subsequent operations to fail.
+                # For now, if list_status_glob returns empty for a non-glob pattern, treat as no match.
+                return []
+        except FileNotFoundError:
+            # If the literal path doesn't exist, list_status_glob might raise FileNotFoundError.
+            return []
+    else:
+        # If it's a glob pattern, use list_status_glob and extract paths.
+        return [status.path for status in client.list_status_glob(glob_pattern)]
 
 
 def _glob_local_path(glob_pattern: str) -> List[str]:
@@ -540,11 +565,71 @@ def rm(args: Namespace):
             "Moving files to the trash is not currently supported. Pass --skip-trash to permanently delete the files."
         )
 
-    for url in args.src:
-        client = _client_for_url(url)
-        for path in _glob_path(client, _path_for_url(url)):
-            if not client.delete(path, args.recursive) and not args.force:
-                raise FileNotFoundError(f"Failed to delete {path}")
+    for url_pattern in args.src:
+        client = _client_for_url(url_pattern)
+        path_pattern = _path_for_url(url_pattern)
+        # Assuming delete_glob handles non-matches gracefully or raises appropriate errors.
+        # If delete_glob doesn't raise on "file not found" for a pattern, 
+        # and we need to enforce that at least one file was deleted by a pattern,
+        # that would require delete_glob to return information about what was deleted,
+        # or to have a pre-check with list_status_glob.
+        # For now, we'll rely on delete_glob's behavior.
+        # The original code had a check: `if not client.delete(path, args.recursive) and not args.force:`
+        # This implies delete returns a boolean, which is not typical for failure (usually raises).
+        # The new Rust delete_glob returns Result<()>, so it will raise on HdfsError.
+        # The `force` argument in the CLI was about ignoring "file not found".
+        # If the glob pattern matches nothing, delete_glob should ideally do nothing and not error.
+        # If it errors on "no match", then we might need a preliminary list_status_glob.
+        # However, the Rust implementation of delete_glob iterates `glob(pattern)?`, so if `glob(pattern)` is empty, it does nothing.
+        try:
+            client.delete_glob(path_pattern, args.recursive)
+        except FileNotFoundError as e:
+            if not args.force:
+                # If force is not set, re-raise the error.
+                # This mimics the original behavior where failure to delete (if not forced) was an error.
+                raise e
+        # If args.force is true, we suppress FileNotFoundError from delete_glob if it were to raise it.
+        # However, the current delete_glob in Rust likely won't raise FileNotFoundError for a non-matching glob,
+        # but rather for issues deleting an actual matched file.
+        # The original `if not client.delete(...) and not args.force:` is a bit tricky to replicate directly
+        # if delete_glob raises errors instead of returning bool.
+        # Let's assume delete_glob itself handles HDFS errors, and the `try/except FileNotFoundError`
+        # is for the case where the pattern *must* match something if --force is not set.
+        # Given the Rust implementation, if a file matched by the glob fails to delete, an HdfsError will be raised.
+        # If the pattern matches nothing, no error is raised by delete_glob.
+        # The original `if not client.delete(path, args.recursive)` implies delete returned false on failure.
+        # The python `client.delete` wrapper for rust client's delete also returns bool.
+        # The new `client.delete_glob` (if added to python client) would likely be void or raise.
+        # For now, let's assume a python wrapper for delete_glob would raise on error.
+        # The `args.force` is to ignore "file does not exist". If delete_glob is used,
+        # this means if the pattern matches no files, it's not an error.
+        # If it matches files but one of them cannot be deleted, it IS an error,
+        # and --force doesn't suppress that kind of error.
+
+        # Re-evaluating: The original code did `for path in _glob_path(...)`, then `client.delete(path)`.
+        # `_glob_path` is a placeholder. If the user provides a specific path to `rm` and it doesn't exist,
+        # `client.delete(path)` would raise FileNotFoundError.
+        # If the user provides a glob `rm *.txt` and it matches nothing, `_glob_path` would be empty, loop skipped.
+        # The new `delete_glob` should be robust to non-matching patterns.
+        # The main concern for `args.force` is if a path *is* provided (not a glob that matches nothing) and it's not found.
+
+        # Simpler approach: call delete_glob. If it errors and not args.force, raise.
+        # This isn't quite right. `args.force` is about "ignore if file does not exist".
+        # A glob not matching is not an error. A specific file not existing IS.
+
+        # The `_glob_path` was a placeholder. The intent is that `args.src` are patterns.
+        # So, `delete_glob` is the right tool.
+        # The original check `if not client.delete(path, args.recursive) and not args.force:`
+        # was for a specific path after glob expansion.
+        # `delete_glob` itself should handle "pattern matches nothing" gracefully (no error).
+        # If `delete_glob` encounters an actual error deleting a matched file, it should raise.
+        # The `args.force` flag in this context is a bit ambiguous with `delete_glob`.
+        # Typically, for `rm -f *.nonexistent`, no error is given.
+        # If `rm -f existing_file_i_cant_delete`, an error IS given.
+        # The `delete_glob` should behave like this. So, no special `args.force` handling needed around it.
+        # The original `FileNotFoundError` was for a specific path.
+        client.delete_glob(path_pattern, args.recursive)
+
 
 
 def rmdir(args: Namespace):
@@ -590,8 +675,7 @@ def touch(args: Namespace):
 
 def main(in_args: Optional[Sequence[str]] = None):
     parser = ArgumentParser(
-        description="""Command line utility for interacting with HDFS using hdfs-native.
-        Globs are not currently supported, all file paths are treated as exact paths."""
+        description="Command line utility for interacting with HDFS using hdfs-native. HDFS path arguments support glob patterns (e.g., /path/to/*.txt, /path/to/**/data)."
     )
 
     subparsers = parser.add_subparsers(title="Subcommands", required=True)

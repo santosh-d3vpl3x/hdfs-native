@@ -1,6 +1,6 @@
 import io
 import os
-from typing import TYPE_CHECKING, Dict, Iterator, List, Optional
+from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Iterator as PyIterator
 
 # For some reason mypy doesn't think this exists
 from typing_extensions import Buffer  # type: ignore
@@ -257,3 +257,23 @@ class Client:
         Get the ACL status for the file or directory at `path`.
         """
         return self.inner.get_acl_status(path)
+
+    # Glob methods
+    def list_status_glob(self, pattern: str) -> PyIterator[FileStatus]:
+        """
+        Returns an iterator over the statuses of files/directories matching the glob pattern.
+        """
+        return self.inner.list_status_glob(pattern)
+
+    def delete_glob(self, pattern: str, recursive: bool = False) -> None:
+        """
+        Deletes the files/directories matching the glob pattern.
+        If `recursive` is True, also deletes directory contents.
+        """
+        return self.inner.delete_glob(pattern, recursive)
+
+    def get_content_summary_glob(self, pattern: str) -> ContentSummary:
+        """
+        Gets the content summary of the files/directories matching the glob pattern.
+        """
+        return self.inner.get_content_summary_glob(pattern)

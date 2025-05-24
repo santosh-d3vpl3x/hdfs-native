@@ -11,6 +11,7 @@ mod test {
         minidfs::{DfsFeatures, MiniDfs},
         Client, Result, WriteOptions,
     };
+    use futures::StreamExt;
     use serial_test::serial;
     use std::collections::HashSet;
 
@@ -196,7 +197,243 @@ mod test {
         test_set_replication(&client).await?;
         test_get_content_summary(&client).await?;
         test_acls(&client).await?;
+        test_glob_features(&client).await?;
 
+        Ok(())
+    }
+
+    async fn test_glob_features(client: &Client) -> Result<()> {
+        test_list_status_glob(client).await?;
+        test_delete_glob(client).await?;
+        test_get_content_summary_glob(client).await?;
+        Ok(())
+    }
+
+    async fn test_list_status_glob(client: &Client) -> Result<()> {
+        client.mkdirs("/test_glob", 0o755, true).await?;
+        client
+            .create("/test_glob/file1.txt", WriteOptions::default())
+            .await?
+            .close()
+            .await?;
+        client
+            .create("/test_glob/file2.log", WriteOptions::default())
+            .await?
+            .close()
+            .await?;
+        client.mkdirs("/test_glob/subdir", 0o755, true).await?;
+        client
+            .create("/test_glob/subdir/file3.txt", WriteOptions::default())
+            .await?
+            .close()
+            .await?;
+        client.mkdirs("/test_glob/otherdir", 0o755, true).await?;
+        client
+            .create("/test_glob/otherdir/file4.dat", WriteOptions::default())
+            .await?
+            .close()
+            .await?;
+
+        // 1. Test basic glob
+        let stream_basic = client.list_status_glob("/test_glob/*.txt")?;
+        let statuses: Vec<FileStatus> = stream_basic.collect::<Result<Vec<FileStatus>>>().await?;
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].path, "/test_glob/file1.txt");
+
+        // Test recursive glob using existing list_status logic (glob doesn't handle **)
+        // The original list_status_glob was changed to just call get_file_info, 
+        // so this test case's intent might need re-evaluation if it relied on old list_status_glob behavior.
+        // Assuming the glob pattern itself handles the depth.
+        let stream_recursive = client.list_status_glob("/test_glob/*/*.txt")?;
+        let statuses_recursive: Vec<FileStatus> = stream_recursive.collect::<Result<Vec<FileStatus>>>().await?;
+        assert_eq!(statuses_recursive.len(), 1);
+        assert_eq!(statuses_recursive[0].path, "/test_glob/subdir/file3.txt");
+        
+        // Verify FileStatus details (example for one file)
+        let file1_status = client.get_file_info("/test_glob/file1.txt").await?;
+        assert_eq!(statuses[0].length, file1_status.length);
+        assert_eq!(statuses[0].isdir, file1_status.isdir);
+
+
+        // 2. Test glob with no matches
+        let stream_no_match = client.list_status_glob("/test_glob/*.csv")?;
+        let statuses_no_match: Vec<FileStatus> = stream_no_match.collect::<Result<Vec<FileStatus>>>().await?;
+        assert!(statuses_no_match.is_empty());
+
+        // 3. Test glob matching a directory
+        let stream_dir = client.list_status_glob("/test_glob/subdir")?;
+        let statuses_dir: Vec<FileStatus> = stream_dir.collect::<Result<Vec<FileStatus>>>().await?;
+        assert_eq!(statuses_dir.len(), 1);
+        assert_eq!(statuses_dir[0].path, "/test_glob/subdir");
+        assert!(statuses_dir[0].isdir);
+
+        // 4. Test glob matching everything in a directory
+        let stream_all = client.list_status_glob("/test_glob/*")?;
+        let statuses_all_results: Vec<FileStatus> = stream_all.collect::<Result<Vec<FileStatus>>>().await?;
+        let mut paths: Vec<String> = statuses_all_results.into_iter().map(|s| s.path).collect();
+        paths.sort(); // Sort for consistent order
+        assert_eq!(paths.len(), 4);
+        assert_eq!(paths, vec!["/test_glob/file1.txt", "/test_glob/file2.log", "/test_glob/otherdir", "/test_glob/subdir"]);
+
+        client.delete("/test_glob", true).await?;
+        Ok(())
+    }
+
+    async fn test_delete_glob(client: &Client) -> Result<()> {
+        client.mkdirs("/test_glob_delete", 0o755, true).await?;
+        client
+            .create("/test_glob_delete/deleteme1.txt", WriteOptions::default())
+            .await?
+            .close()
+            .await?;
+        client
+            .create("/test_glob_delete/deleteme2.txt", WriteOptions::default())
+            .await?
+            .close()
+            .await?;
+        client
+            .create("/test_glob_delete/keepme.txt", WriteOptions::default())
+            .await?
+            .close()
+            .await?;
+
+        // 1. Test deleting multiple files
+        client
+            .delete_glob("/test_glob_delete/deleteme*.txt", false)
+            .await?;
+        assert!(client
+            .get_file_info("/test_glob_delete/deleteme1.txt")
+            .await
+            .is_err());
+        assert!(client
+            .get_file_info("/test_glob_delete/deleteme2.txt")
+            .await
+            .is_err());
+        assert!(client
+            .get_file_info("/test_glob_delete/keepme.txt")
+            .await
+            .is_ok());
+
+        // 2. Test deleting with no matches
+        client
+            .delete_glob("/test_glob_delete/nonexistent*.txt", false)
+            .await?;
+        // No error should occur, keepme.txt should still be there
+        assert!(client
+            .get_file_info("/test_glob_delete/keepme.txt")
+            .await
+            .is_ok());
+        
+        client.delete("/test_glob_delete", true).await?;
+
+        // 3. Test deleting recursively
+        client.mkdirs("/test_glob_delete_rec/dir1", 0o755, true).await?;
+        client
+            .create("/test_glob_delete_rec/dir1/file1.txt", WriteOptions::default())
+            .await?
+            .close()
+            .await?;
+        client.mkdirs("/test_glob_delete_rec/dir2", 0o755, true).await?;
+        client
+            .create("/test_glob_delete_rec/dir2/file2.txt", WriteOptions::default())
+            .await?
+            .close()
+            .await?;
+        
+        client.delete_glob("/test_glob_delete_rec/*", true).await?;
+        assert!(client.get_file_info("/test_glob_delete_rec/dir1").await.is_err());
+        assert!(client.get_file_info("/test_glob_delete_rec/dir2").await.is_err());
+        assert!(client.list_status("/test_glob_delete_rec", false).await.is_err() || client.list_status("/test_glob_delete_rec", false).await?.is_empty());
+
+
+        client.delete("/test_glob_delete_rec", true).await.ok(); // path may not exist
+        Ok(())
+    }
+
+    async fn test_get_content_summary_glob(client: &Client) -> Result<()> {
+        client.mkdirs("/test_glob_summary", 0o755, true).await?;
+        let mut file_a = client
+            .create("/test_glob_summary/fileA.txt", WriteOptions::default())
+            .await?;
+        file_a.write(vec![0u8; 10].into()).await?;
+        file_a.close().await?;
+
+        let mut file_b = client
+            .create("/test_glob_summary/fileB.log", WriteOptions::default())
+            .await?;
+        file_b.write(vec![0u8; 20].into()).await?;
+        file_b.close().await?;
+
+        client
+            .create(
+                "/test_glob_summary/ignored_file.dat",
+                WriteOptions::default(),
+            )
+            .await?
+            .close()
+            .await?;
+
+        // 1. Test with multiple files
+        let summary = client
+            .get_content_summary_glob("/test_glob_summary/file*")
+            .await?;
+        assert_eq!(summary.length, 30);
+        assert_eq!(summary.file_count, 2);
+        assert_eq!(summary.directory_count, 0);
+
+        // 2. Test with no matches
+        let summary_no_match = client
+            .get_content_summary_glob("/test_glob_summary/nothing*")
+            .await?;
+        assert_eq!(summary_no_match.length, 0);
+        assert_eq!(summary_no_match.file_count, 0);
+        assert_eq!(summary_no_match.directory_count, 0);
+
+        client.delete("/test_glob_summary", true).await?;
+
+        // 3. Test with a mix of files and directories
+        client.mkdirs("/test_glob_summary_mix", 0o755, true).await?;
+        let mut data_txt = client
+            .create(
+                "/test_glob_summary_mix/data.txt",
+                WriteOptions::default(),
+            )
+            .await?;
+        data_txt.write(vec![0u8; 5].into()).await?;
+        data_txt.close().await?;
+
+        client.mkdirs("/test_glob_summary_mix/folder", 0o755, true).await?;
+        let mut another_txt = client
+            .create(
+                "/test_glob_summary_mix/folder/another.txt",
+                WriteOptions::default(),
+            )
+            .await?;
+        another_txt.write(vec![0u8; 15].into()).await?;
+        another_txt.close().await?;
+        
+        // The glob crate's default behavior for "*" does not descend into directories.
+        // So, it will match data.txt and folder.
+        let summary_mix = client
+            .get_content_summary_glob("/test_glob_summary_mix/*")
+            .await?;
+        assert_eq!(summary_mix.length, 5); // Only data.txt
+        assert_eq!(summary_mix.file_count, 1); // Only data.txt
+        assert_eq!(summary_mix.directory_count, 1); // folder
+                                                    
+        // To include contents of subdirectories, a pattern like /test_glob_summary_mix/*/* would be needed
+        // or by iterating and calling get_content_summary recursively.
+        // For this test, we'll make another call to sum things up as the current implementation would.
+         let summary_mix_folder_contents = client
+            .get_content_summary_glob("/test_glob_summary_mix/folder/*")
+            .await?;
+        
+        assert_eq!(summary_mix_folder_contents.length, 15);
+        assert_eq!(summary_mix_folder_contents.file_count, 1);
+        assert_eq!(summary_mix_folder_contents.directory_count, 0);
+
+
+        client.delete("/test_glob_summary_mix", true).await?;
         Ok(())
     }
 

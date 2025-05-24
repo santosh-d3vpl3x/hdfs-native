@@ -578,6 +578,31 @@ impl RawClient {
             .allow_threads(|| self.rt.block_on(self.inner.get_acl_status(path)))?
             .into())
     }
+
+    // Glob methods
+    pub fn list_status_glob(
+        &self,
+        pattern: &str,
+        _py: Python, // _py is not strictly needed here unless for GIL release, which is handled in iterator
+    ) -> PyHdfsResult<PyListStatusGlobIterator> {
+        let stream = self.inner.list_status_glob(pattern)?;
+        Ok(PyListStatusGlobIterator {
+            inner: Arc::new(Mutex::new(stream)),
+            rt: Arc::clone(&self.rt),
+        })
+    }
+
+    pub fn delete_glob(&self, pattern: &str, recursive: bool, py: Python) -> PyHdfsResult<()> {
+        Ok(
+            py.allow_threads(|| self.rt.block_on(self.inner.delete_glob(pattern, recursive)))?,
+        )
+    }
+
+    pub fn get_content_summary_glob(&self, pattern: &str, py: Python) -> PyHdfsResult<PyContentSummary> {
+        Ok(py
+            .allow_threads(|| self.rt.block_on(self.inner.get_content_summary_glob(pattern)))?
+            .into())
+    }
 }
 
 /// A Python module implemented in Rust.
@@ -589,5 +614,35 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWriteOptions>()?;
     m.add_class::<PyAclEntry>()?;
     m.add_class::<PyAclStatus>()?;
+    m.add_class::<PyListStatusGlobIterator>()?;
     Ok(())
+}
+
+#[pyclass(name = "ListStatusGlobIterator")]
+struct PyListStatusGlobIterator {
+    inner: Arc<Mutex<BoxStream<'static, hdfs_native::Result<FileStatus>>>>,
+    rt: Arc<Runtime>,
+}
+
+#[pymethods]
+impl PyListStatusGlobIterator {
+    pub fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(slf: PyRefMut<'_, Self>) -> PyHdfsResult<Option<PyFileStatus>> {
+        let inner_arc = Arc::clone(&slf.inner);
+        let rt_arc = Arc::clone(&slf.rt);
+
+        let result = slf.py().allow_threads(|| {
+            let mut stream = inner_arc.lock().unwrap();
+            rt_arc.block_on(stream.next())
+        });
+
+        match result {
+            Some(Ok(file_status)) => Ok(Some(PyFileStatus::from(file_status))),
+            Some(Err(e)) => Err(PythonHdfsError::from(e)),
+            None => Ok(None),
+        }
+    }
 }

@@ -1,8 +1,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use futures::future::try_join_all;
 use futures::stream::BoxStream;
 use futures::{stream, StreamExt};
+use glob::glob;
 use url::Url;
 
 use crate::acl::{AclEntry, AclStatus};
@@ -129,7 +131,7 @@ impl MountTable {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Client {
     mount_table: Arc<MountTable>,
     config: Arc<Configuration>,
@@ -551,6 +553,84 @@ impl Client {
             .await?
             .result
             .into())
+    }
+
+    /// Lists the statuses of the files/directories matching the glob pattern as a stream.
+    pub fn list_status_glob(
+        &self,
+        pattern: &str,
+    ) -> Result<BoxStream<'static, Result<FileStatus>>> {
+        let glob_results = match glob(pattern) {
+            Ok(paths) => paths,
+            Err(pattern_error) => return Err(HdfsError::from(pattern_error)),
+        };
+
+        let client = self.clone();
+
+        let stream = stream::iter(glob_results)
+            .map(move |glob_result| {
+                let client_clone = client.clone();
+                async move {
+                    match glob_result {
+                        Ok(path_buf) => {
+                            let path_str = path_buf.to_string_lossy().into_owned();
+                            client_clone.get_file_info(&path_str).await
+                        }
+                        Err(glob_error) => Err(HdfsError::from(glob_error)),
+                    }
+                }
+            })
+            // Use buffer_unordered to execute the get_file_info calls concurrently.
+            // The number of concurrent operations can be tuned. Let's use a reasonable default.
+            .buffer_unordered(num_cpus::get() * 2) // Example concurrency level
+            .boxed();
+
+        Ok(stream)
+    }
+
+    /// Deletes the files/directories matching the glob pattern.
+    pub async fn delete_glob(&self, pattern: &str, recursive: bool) -> Result<()> {
+        // Collect all delete futures
+        let mut delete_futures = Vec::new();
+        for entry in glob(pattern)? {
+            let path = entry?.to_string_lossy().to_string();
+            delete_futures.push(self.delete(&path, recursive));
+        }
+
+        // Execute all deletes in parallel and return on the first error
+        try_join_all(delete_futures).await?;
+        Ok(())
+    }
+
+    /// Gets the content summary of the files/directories matching the glob pattern.
+    pub async fn get_content_summary_glob(&self, pattern: &str) -> Result<ContentSummary> {
+        let mut aggregated_summary = ContentSummary {
+            length: 0,
+            file_count: 0,
+            directory_count: 0,
+            quota: 0,
+            space_consumed: 0,
+            space_quota: 0,
+        };
+
+        let mut summary_futures = Vec::new();
+        for entry in glob(pattern)? {
+            let path = entry?.to_string_lossy().to_string();
+            summary_futures.push(self.get_content_summary(&path));
+        }
+
+        let summaries = try_join_all(summary_futures).await?;
+
+        for summary in summaries {
+            aggregated_summary.length += summary.length;
+            aggregated_summary.file_count += summary.file_count;
+            aggregated_summary.directory_count += summary.directory_count;
+            aggregated_summary.quota += summary.quota;
+            aggregated_summary.space_consumed += summary.space_consumed;
+            aggregated_summary.space_quota += summary.space_quota;
+        }
+
+        Ok(aggregated_summary)
     }
 }
 

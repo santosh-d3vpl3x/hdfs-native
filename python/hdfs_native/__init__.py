@@ -263,7 +263,7 @@ class Client:
         """
         Returns an iterator over the statuses of files/directories matching the glob pattern.
         """
-        return self.inner.list_status_glob(pattern)
+        return iter(self.inner.list_status_glob(pattern))
 
     def delete_glob(self, pattern: str, recursive: bool = False) -> None:
         """

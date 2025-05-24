@@ -5,7 +5,7 @@ mod common;
 mod test {
     use crate::common::{assert_bufs_equal, TEST_FILE_INTS};
     use bytes::{BufMut, BytesMut};
-    use futures::StreamExt;
+    use futures::{StreamExt, stream::TryStreamExt};
     use hdfs_native::{
         acl::AclEntry,
         client::FileStatus,
@@ -236,7 +236,7 @@ mod test {
 
         // 1. Test basic glob
         let stream_basic = client.list_status_glob("/test_glob/*.txt")?;
-        let statuses: Vec<FileStatus> = stream_basic.collect::<Result<Vec<FileStatus>>>().await?;
+        let statuses: Vec<FileStatus> = stream_basic.try_collect().await?;
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].path, "/test_glob/file1.txt");
 
@@ -245,9 +245,7 @@ mod test {
         // so this test case's intent might need re-evaluation if it relied on old list_status_glob behavior.
         // Assuming the glob pattern itself handles the depth.
         let stream_recursive = client.list_status_glob("/test_glob/*/*.txt")?;
-        let statuses_recursive: Vec<FileStatus> = stream_recursive
-            .collect::<Result<Vec<FileStatus>>>()
-            .await?;
+        let statuses_recursive: Vec<FileStatus> = stream_recursive.try_collect().await?;
         assert_eq!(statuses_recursive.len(), 1);
         assert_eq!(statuses_recursive[0].path, "/test_glob/subdir/file3.txt");
 
@@ -258,21 +256,19 @@ mod test {
 
         // 2. Test glob with no matches
         let stream_no_match = client.list_status_glob("/test_glob/*.csv")?;
-        let statuses_no_match: Vec<FileStatus> =
-            stream_no_match.collect::<Result<Vec<FileStatus>>>().await?;
+        let statuses_no_match: Vec<FileStatus> = stream_no_match.try_collect().await?;
         assert!(statuses_no_match.is_empty());
 
         // 3. Test glob matching a directory
         let stream_dir = client.list_status_glob("/test_glob/subdir")?;
-        let statuses_dir: Vec<FileStatus> = stream_dir.collect::<Result<Vec<FileStatus>>>().await?;
+        let statuses_dir: Vec<FileStatus> = stream_dir.try_collect().await?;
         assert_eq!(statuses_dir.len(), 1);
         assert_eq!(statuses_dir[0].path, "/test_glob/subdir");
         assert!(statuses_dir[0].isdir);
 
         // 4. Test glob matching everything in a directory
         let stream_all = client.list_status_glob("/test_glob/*")?;
-        let statuses_all_results: Vec<FileStatus> =
-            stream_all.collect::<Result<Vec<FileStatus>>>().await?;
+        let statuses_all_results: Vec<FileStatus> = stream_all.try_collect().await?;
         let mut paths: Vec<String> = statuses_all_results.into_iter().map(|s| s.path).collect();
         paths.sort(); // Sort for consistent order
         assert_eq!(paths.len(), 4);

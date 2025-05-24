@@ -64,7 +64,7 @@ impl From<glob::GlobError> for HdfsError {
         // glob::GlobError typically wraps an std::io::Error.
         // We can choose to store its string representation or map it to HdfsError::IOError directly if preferred.
         // For this task, let's store its string representation in HdfsError::Glob for clarity.
-        HdfsError::Glob(format!("Glob error: {}", err.into_error().to_string()))
+        HdfsError::Glob(format!("Glob error: {}", err.into_error()))
     }
 }
 

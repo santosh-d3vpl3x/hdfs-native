@@ -594,7 +594,7 @@ impl Client {
         let mut delete_futures = Vec::new();
         for entry in glob(pattern)? {
             let path = entry?.to_string_lossy().to_string();
-            delete_futures.push(self.delete(&path, recursive));
+            delete_futures.push(self.delete(&path.clone(), recursive));
         }
 
         // Execute all deletes in parallel and return on the first error
@@ -616,7 +616,7 @@ impl Client {
         let mut summary_futures = Vec::new();
         for entry in glob(pattern)? {
             let path = entry?.to_string_lossy().to_string();
-            summary_futures.push(self.get_content_summary(path.clone()));
+            summary_futures.push(self.get_content_summary(&path.clone()));
         }
 
         let summaries = try_join_all(summary_futures).await?;

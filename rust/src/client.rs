@@ -616,7 +616,7 @@ impl Client {
         let mut summary_futures = Vec::new();
         for entry in glob(pattern)? {
             let path = entry?.to_string_lossy().to_string();
-            summary_futures.push(self.get_content_summary(&path));
+            summary_futures.push(self.get_content_summary(path.clone()));
         }
 
         let summaries = try_join_all(summary_futures).await?;

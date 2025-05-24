@@ -47,6 +47,25 @@ pub enum HdfsError {
     GSSAPIError(crate::security::gssapi::GssMajorCodes, u32, String),
     #[error("No valid SASL mechanism found")]
     NoSASLMechanism,
+    #[error("glob pattern error: {0}")]
+    GlobPattern(String),
+    #[error("glob execution error: {0}")]
+    Glob(String),
+}
+
+impl From<glob::PatternError> for HdfsError {
+    fn from(err: glob::PatternError) -> Self {
+        HdfsError::GlobPattern(format!("{} at offset {}", err.msg, err.pos))
+    }
+}
+
+impl From<glob::GlobError> for HdfsError {
+    fn from(err: glob::GlobError) -> Self {
+        // glob::GlobError typically wraps an std::io::Error.
+        // We can choose to store its string representation or map it to HdfsError::IOError directly if preferred.
+        // For this task, let's store its string representation in HdfsError::Glob for clarity.
+        HdfsError::Glob(format!("Glob error: {}", err.into_io_error().to_string()))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, HdfsError>;

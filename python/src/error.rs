@@ -20,6 +20,12 @@ impl From<PythonHdfsError> for PyErr {
             HdfsError::FileNotFound(path) => PyFileNotFoundError::new_err(path),
             HdfsError::IsADirectoryError(path) => PyIsADirectoryError::new_err(path),
             HdfsError::UnsupportedFeature(feat) => PyNotImplementedError::new_err(feat),
+            HdfsError::GlobPattern(msg) => {
+                pyo3::exceptions::PyValueError::new_err(format!("Invalid glob pattern: {}", msg))
+            }
+            HdfsError::Glob(msg) => {
+                pyo3::exceptions::PyIOError::new_err(format!("Glob execution error: {}", msg))
+            }
             _ => PyRuntimeError::new_err(format!("{:?}", value.0)),
         }
     }

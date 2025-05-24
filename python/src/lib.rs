@@ -593,19 +593,14 @@ impl RawClient {
     }
 
     pub fn delete_glob(&self, pattern: &str, recursive: bool, py: Python) -> PyHdfsResult<()> {
-        Ok(py.allow_threads(|| self.rt.block_on(self.inner.delete_glob(pattern, recursive)))?)
+        Ok(
+            py.allow_threads(|| self.rt.block_on(self.inner.delete_glob(pattern, recursive)))?,
+        )
     }
 
-    pub fn get_content_summary_glob(
-        &self,
-        pattern: &str,
-        py: Python,
-    ) -> PyHdfsResult<PyContentSummary> {
+    pub fn get_content_summary_glob(&self, pattern: &str, py: Python) -> PyHdfsResult<PyContentSummary> {
         Ok(py
-            .allow_threads(|| {
-                self.rt
-                    .block_on(self.inner.get_content_summary_glob(pattern))
-            })?
+            .allow_threads(|| self.rt.block_on(self.inner.get_content_summary_glob(pattern)))?
             .into())
     }
 }

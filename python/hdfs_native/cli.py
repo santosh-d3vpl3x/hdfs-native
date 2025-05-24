@@ -569,7 +569,7 @@ def rm(args: Namespace):
         client = _client_for_url(url_pattern)
         path_pattern = _path_for_url(url_pattern)
         # Assuming delete_glob handles non-matches gracefully or raises appropriate errors.
-        # If delete_glob doesn't raise on "file not found" for a pattern,
+        # If delete_glob doesn't raise on "file not found" for a pattern, 
         # and we need to enforce that at least one file was deleted by a pattern,
         # that would require delete_glob to return information about what was deleted,
         # or to have a pre-check with list_status_glob.
@@ -629,6 +629,7 @@ def rm(args: Namespace):
         # The `delete_glob` should behave like this. So, no special `args.force` handling needed around it.
         # The original `FileNotFoundError` was for a specific path.
         client.delete_glob(path_pattern, args.recursive)
+
 
 
 def rmdir(args: Namespace):

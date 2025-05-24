@@ -596,7 +596,8 @@ impl Client {
         }
 
         let mut delete_futures = Vec::new();
-        for path_str in &paths_to_delete { // Iterate over references to strings in the Vec
+        for path_str in &paths_to_delete {
+            // Iterate over references to strings in the Vec
             delete_futures.push(self.delete(path_str, recursive)); // path_str is &String, coerces to &str
         }
 
@@ -621,7 +622,8 @@ impl Client {
         }
 
         let mut summary_futures = Vec::new();
-        for path_str in &paths_to_summarize { // Iterate over references to strings in the Vec
+        for path_str in &paths_to_summarize {
+            // Iterate over references to strings in the Vec
             summary_futures.push(self.get_content_summary(path_str)); // path_str is &String, coerces to &str
         }
 

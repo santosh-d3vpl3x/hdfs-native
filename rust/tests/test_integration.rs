@@ -5,7 +5,7 @@ mod common;
 mod test {
     use crate::common::{assert_bufs_equal, TEST_FILE_INTS};
     use bytes::{BufMut, BytesMut};
-    use futures::{StreamExt, stream::TryStreamExt};
+    use futures::stream::TryStreamExt;
     use hdfs_native::{
         acl::AclEntry,
         client::FileStatus,

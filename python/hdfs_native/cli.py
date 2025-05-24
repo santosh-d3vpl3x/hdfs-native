@@ -82,7 +82,7 @@ def _glob_path(client: Client, glob_pattern: str) -> List[str]:
             # Convert iterator to list to check if it yielded anything
             # and to be able to reuse its contents.
             status_list = list(client.list_status_glob(glob_pattern))
-            if status_list: # Now check if the list is non-empty
+            if status_list:  # Now check if the list is non-empty
                 return [status.path for status in status_list]
             else:
                 # Path does not exist or list_status_glob returned empty for other reasons.

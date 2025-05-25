@@ -196,7 +196,116 @@ mod test {
         test_set_replication(&client).await?;
         test_get_content_summary(&client).await?;
         test_acls(&client).await?;
+        test_list_status_glob(&client).await?;
 
+        Ok(())
+    }
+
+    async fn test_list_status_glob(client: &Client) -> Result<()> {
+        let base_dir = "/tmp/glob_tests_rs";
+        client.mkdirs(base_dir, 0o755, true).await.ok(); // Clean up previous if any
+        client.delete(base_dir, true).await.ok(); // Clean up previous if any
+        client.mkdirs(base_dir, 0o755, true).await?;
+
+        let opts = WriteOptions::default();
+        client.create(&format!("{}/file1.txt", base_dir), &opts).await?.close().await?;
+        client.create(&format!("{}/file2.log", base_dir), &opts).await?.close().await?;
+        client.create(&format!("{}/another.txt", base_dir), &opts).await?.close().await?;
+        client.mkdirs(&format!("{}/subdir1", base_dir), 0o755, true).await?;
+        client.create(&format!("{}/subdir1/file3.txt", base_dir), &opts).await?.close().await?;
+        client.create(&format!("{}/subdir1/file4.log", base_dir), &opts).await?.close().await?;
+        client.mkdirs(&format!("{}/subdir1/nesteddir", base_dir), 0o755, true).await?;
+        client.create(&format!("{}/subdir1/nesteddir/file5.txt", base_dir), &opts).await?.close().await?;
+        client.mkdirs(&format!("{}/subdir2", base_dir), 0o755, true).await?;
+        client.create(&format!("{}/subdir2/file6.log", base_dir), &opts).await?.close().await?;
+
+        // 2. Simple pattern: "/tmp/glob_tests_rs/*.txt"
+        let mut stream = client.list_status_glob(&format!("{base_dir}/*.txt"))?;
+        let mut found_files = Vec::new();
+        while let Some(status_res) = stream.next().await {
+            found_files.push(status_res?.path);
+        }
+        found_files.sort();
+        assert_eq!(found_files, vec![
+            format!("{base_dir}/another.txt"),
+            format!("{base_dir}/file1.txt"),
+        ]);
+
+        // 3. Recursive pattern: "/tmp/glob_tests_rs/**/*.log"
+        let mut stream = client.list_status_glob(&format!("{base_dir}/**/*.log"))?;
+        let mut found_files = Vec::new();
+        while let Some(status_res) = stream.next().await {
+            let status = status_res?;
+            // glob can return directories with **, filter them out for this test based on extension
+            if status.path.ends_with(".log") && !status.isdir {
+                found_files.push(status.path);
+            }
+        }
+        found_files.sort();
+        assert_eq!(found_files, vec![
+            format!("{base_dir}/file2.log"),
+            format!("{base_dir}/subdir1/file4.log"),
+            format!("{base_dir}/subdir2/file6.log"),
+        ]);
+
+        // 4. Pattern matching specific directory: "/tmp/glob_tests_rs/subdir1"
+        // The glob crate itself might return it with or without a trailing slash depending on the pattern.
+        // Our current implementation of list_status_glob just stats the path glob returns.
+        let mut stream = client.list_status_glob(&format!("{base_dir}/subdir1"))?;
+        let status = stream.next().await.unwrap()?;
+        assert_eq!(status.path, format!("{base_dir}/subdir1"));
+        assert!(status.isdir);
+        assert!(stream.next().await.is_none());
+
+
+        // 5. Pattern matching files in specific directory: "/tmp/glob_tests_rs/subdir1/*"
+        let mut stream = client.list_status_glob(&format!("{base_dir}/subdir1/*"))?;
+        let mut found_items = Vec::new();
+        while let Some(status_res) = stream.next().await {
+            found_items.push(status_res?.path);
+        }
+        found_items.sort();
+        assert_eq!(found_items, vec![
+            format!("{base_dir}/subdir1/file3.txt"),
+            format!("{base_dir}/subdir1/file4.log"),
+            format!("{base_dir}/subdir1/nesteddir"),
+        ]);
+        
+        // 6. Pattern matching files in nested directory: "/tmp/glob_tests_rs/subdir1/nesteddir/*"
+        let mut stream = client.list_status_glob(&format!("{base_dir}/subdir1/nesteddir/*"))?;
+        let mut found_items = Vec::new();
+        while let Some(status_res) = stream.next().await {
+            found_items.push(status_res?.path);
+        }
+        found_items.sort();
+        assert_eq!(found_items, vec![
+            format!("{base_dir}/subdir1/nesteddir/file5.txt"),
+        ]);
+
+        // 7. No match pattern: "/tmp/glob_tests_rs/*.nonexistent"
+        let mut stream = client.list_status_glob(&format!("{base_dir}/*.nonexistent"))?;
+        assert!(stream.next().await.is_none());
+
+        // 8. Invalid pattern: "/tmp/glob_tests_rs/["
+        let result = client.list_status_glob(&format!("{base_dir}/["));
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(matches!(e, hdfs_native::HdfsError::ExternalLibraryError(_, _)));
+        } else {
+            panic!("Expected an error for invalid glob pattern");
+        }
+        
+        // 9. Relative pattern attempt: "*/*.txt" (should fail as per current implementation)
+        let result = client.list_status_glob("*/*.txt");
+        assert!(result.is_err());
+         if let Err(e) = result {
+            assert!(matches!(e, hdfs_native::HdfsError::InvalidArgument(_)));
+        } else {
+            panic!("Expected an error for relative glob pattern");
+        }
+
+        // Teardown
+        client.delete(base_dir, true).await?;
         Ok(())
     }
 

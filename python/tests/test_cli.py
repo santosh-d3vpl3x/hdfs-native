@@ -314,6 +314,166 @@ def test_ls(client: Client):
     assert output == [directory.path, file1.path, file2.path]
 
 
+def test_ls_glob(client: Client):
+    base_dir = "/tmp/test_cli_ls_glob"
+
+    # Cleanup previous run if any
+    try:
+        if client.get_file_info(base_dir): # Check if exists before attempting delete
+            client.delete(base_dir, recursive=True)
+    except FileNotFoundError:
+        pass # It's fine if it doesn't exist
+
+    # Setup
+    client.mkdirs(base_dir, create_parent=True)
+
+    # Create test structure
+    # Root level files
+    client.create(f"{base_dir}/file1.txt").close()
+    client.create(f"{base_dir}/file2.log").close()
+    client.create(f"{base_dir}/data.json").close()
+
+    # Subdir1
+    client.mkdirs(f"{base_dir}/subdir1", create_parent=True)
+    client.create(f"{base_dir}/subdir1/file3.txt").close()
+    client.create(f"{base_dir}/subdir1/file4.log").close()
+    client.create(f"{base_dir}/subdir1/another.json").close()
+
+    # Nested dir in subdir1
+    client.mkdirs(f"{base_dir}/subdir1/nesteddir", create_parent=True)
+    client.create(f"{base_dir}/subdir1/nesteddir/file5.txt").close()
+
+    # Subdir2
+    client.mkdirs(f"{base_dir}/subdir2", create_parent=True)
+    client.create(f"{base_dir}/subdir2/file6.log").close()
+    client.create(f"{base_dir}/subdir2/data.json").close()
+
+    try:
+        # Test cases using ls -C for path-only output, simplifies parsing
+        # Expected paths are absolute from HDFS root.
+
+        # Simple file patterns
+        output = capture_stdout(lambda: cli_main(["ls", "-C", f"{base_dir}/*.txt"])).strip().splitlines()
+        output.sort()
+        assert output == [f"{base_dir}/file1.txt"]
+
+        output = capture_stdout(lambda: cli_main(["ls", "-C", f"{base_dir}/*.log"])).strip().splitlines()
+        output.sort()
+        assert output == [f"{base_dir}/file2.log"]
+
+        output = capture_stdout(lambda: cli_main(["ls", "-C", f"{base_dir}/*.json"])).strip().splitlines()
+        output.sort()
+        assert output == [f"{base_dir}/data.json"]
+
+        # Files in a specific subdirectory
+        output = capture_stdout(lambda: cli_main(["ls", "-C", f"{base_dir}/subdir1/*.txt"])).strip().splitlines()
+        output.sort()
+        assert output == [f"{base_dir}/subdir1/file3.txt"]
+        
+        output = capture_stdout(lambda: cli_main(["ls", "-C", f"{base_dir}/subdir1/*.log"])).strip().splitlines()
+        output.sort()
+        assert output == [f"{base_dir}/subdir1/file4.log"]
+
+        output = capture_stdout(lambda: cli_main(["ls", "-C", f"{base_dir}/subdir1/*.json"])).strip().splitlines()
+        output.sort()
+        assert output == [f"{base_dir}/subdir1/another.json"]
+
+        # Recursive patterns (**)
+        # Note: Sorting is important as glob results order is not guaranteed.
+        # Also, splitlines() is better than split('\n') if there could be empty trailing lines.
+        expected_txt = sorted([
+            f"{base_dir}/file1.txt",
+            f"{base_dir}/subdir1/file3.txt",
+            f"{base_dir}/subdir1/nesteddir/file5.txt",
+        ])
+        output = capture_stdout(lambda: cli_main(["ls", "-C", f"{base_dir}/**/*.txt"])).strip().splitlines()
+        output.sort()
+        assert output == expected_txt
+
+        expected_log = sorted([
+            f"{base_dir}/file2.log",
+            f"{base_dir}/subdir1/file4.log",
+            f"{base_dir}/subdir2/file6.log",
+        ])
+        output = capture_stdout(lambda: cli_main(["ls", "-C", f"{base_dir}/**/*.log"])).strip().splitlines()
+        output.sort()
+        assert output == expected_log
+        
+        expected_json = sorted([
+            f"{base_dir}/data.json",
+            f"{base_dir}/subdir1/another.json",
+            f"{base_dir}/subdir2/data.json",
+        ])
+        output = capture_stdout(lambda: cli_main(["ls", "-C", f"{base_dir}/**/*.json"])).strip().splitlines()
+        output.sort()
+        assert output == expected_json
+
+        # Pattern matching a specific directory itself
+        output = capture_stdout(lambda: cli_main(["ls", "-C", f"{base_dir}/subdir1"])).strip().splitlines()
+        # When `ls` is given a path that is a directory, and -C is not used for recursive listing of its contents,
+        # it should just list that directory.
+        # _glob_path will return the directory path itself.
+        # Then `ls` will call get_file_info on it. Since it's a directory,
+        # without -R, it will effectively just print the info of that directory itself.
+        # With -C, it prints the path.
+        assert output == [f"{base_dir}/subdir1"]
+
+
+        # Pattern matching contents within a directory (e.g., /test_dir/*)
+        expected_root_star = sorted([
+            f"{base_dir}/data.json",
+            f"{base_dir}/file1.txt",
+            f"{base_dir}/file2.log",
+            f"{base_dir}/subdir1",
+            f"{base_dir}/subdir2",
+        ])
+        output = capture_stdout(lambda: cli_main(["ls", "-C", f"{base_dir}/*"])).strip().splitlines()
+        output.sort()
+        assert output == expected_root_star
+
+        # Pattern matching contents within subdir1
+        expected_subdir1_star = sorted([
+            f"{base_dir}/subdir1/another.json",
+            f"{base_dir}/subdir1/file3.txt",
+            f"{base_dir}/subdir1/file4.log",
+            f"{base_dir}/subdir1/nesteddir",
+        ])
+        output = capture_stdout(lambda: cli_main(["ls", "-C", f"{base_dir}/subdir1/*"])).strip().splitlines()
+        output.sort()
+        assert output == expected_subdir1_star
+        
+        # Pattern matching contents within subdir1/nesteddir
+        output = capture_stdout(lambda: cli_main(["ls", "-C", f"{base_dir}/subdir1/nesteddir/*"])).strip().splitlines()
+        output.sort()
+        assert output == [f"{base_dir}/subdir1/nesteddir/file5.txt"]
+
+        # No match
+        output = capture_stdout(lambda: cli_main(["ls", "-C", f"{base_dir}/*.nonexistent"])).strip().splitlines()
+        assert output == [''] or output == [] # Expect empty or list with one empty string
+
+        # Invalid glob pattern
+        # Based on current _glob_path, this should raise PythonHdfsError, which cli_main doesn't catch.
+        # So pytest.raises is appropriate. The error comes from the Rust layer.
+        # The exact PythonHdfsError might be wrapped by PyO3.
+        # Let's expect a generic Exception that PythonHdfsError would derive from, or SystemExit if cli.py catches it.
+        # From cli.py, _glob_path re-raises, and main() calls args.func(args) without a try-except.
+        # PyO3 errors often become Python exceptions directly.
+        from hdfs_native._internal import PythonHdfsError # Assuming this is the error type
+        with pytest.raises(PythonHdfsError) as exc_info:
+             cli_main(["ls", "-C", f"{base_dir}/[invalidpattern"])
+        # Check if the error message contains something about the glob pattern or syntax
+        assert "Glob" in str(exc_info.value) or "pattern" in str(exc_info.value)
+
+
+    finally:
+        # Teardown: remove the test directory
+        try:
+            if client.get_file_info(base_dir): # Check if exists
+                 client.delete(base_dir, recursive=True)
+        except FileNotFoundError:
+            pass # Already deleted or never created fully
+
+
 def test_mkdir(client: Client):
     cli_main(["mkdir", "/testdir"])
     assert client.get_file_info("/testdir").isdir

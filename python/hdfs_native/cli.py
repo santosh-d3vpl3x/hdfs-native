@@ -66,9 +66,24 @@ def _path_for_url(url: str) -> str:
     return urlparse(url).path
 
 
-def _glob_path(client: Client, glob: str) -> List[str]:
-    # TODO: Actually implement this, for now just pretend we have multiple results
-    return [glob]
+def _glob_path(client: Client, glob_pattern: str) -> List[str]:
+    try:
+        statuses = client.list_status_glob(glob_pattern)
+        return [status.path for status in statuses]
+    except Exception as e:
+        # Log the error or handle it as per CLI requirements
+        # For now, print to stderr and return an empty list or re-raise
+        # Depending on how severe the error should be treated.
+        # If list_status_glob is expected to raise for "no match", that's different
+        # from an invalid pattern. Assuming it returns empty iterator for "no match".
+        # HdfsError (PythonHdfsError) will be raised for invalid patterns or other issues.
+        print(f"Error during glob operation for pattern '{glob_pattern}': {e}", file=sys.stderr)
+        # Decide if to return empty list or re-raise.
+        # For CLI, often failing gracefully for a single bad pattern among many is preferred.
+        # However, if the glob itself is bad, the command might not be able to proceed.
+        # Let's re-raise for now, as the Python bindings convert HdfsError to PythonHdfsError
+        # which should be caught by a top-level handler or terminate the command.
+        raise
 
 
 def _glob_local_path(glob_pattern: str) -> List[str]:

@@ -587,7 +587,7 @@ impl ListStatusGlobIterator {
             pattern
         };
 
-        let glob_paths = glob_lib(&glob_pattern_str).map_err(|e| HdfsError::InvalidArgument(format!("Invalid glob pattern: '{}', error: {}", glob_pattern_orig, e.to_string())))?;
+        let glob_paths = glob_lib(&glob_pattern_str).map_err(|e| HdfsError::InvalidArgument(format!("Invalid glob pattern: '{}', error: {}", glob_pattern_orig, e)))?;
 
         Ok(ListStatusGlobIterator {
             mount_table,
@@ -602,8 +602,8 @@ impl ListStatusGlobIterator {
                 // Convert PathBuf to &str for get_file_info
                 let path_str = match path_buf.to_str() {
                     Some(s) => s,
-                    None => return Some(Err(HdfsError::InvalidPath("Path contains non-UTF8 characters".to_string()))),
-                };
+                    None => Some(Err(HdfsError::InvalidPath("Path contains non-UTF8 characters".to_string()))),
+                }?;
 
                 // Create a temporary client to call get_file_info.
                 // This is a bit awkward. Ideally, ListStatusGlobIterator would have a reference to the Client,
@@ -669,26 +669,26 @@ impl ListStatusGlobIterator {
                                     // For now, let's stick to: stat whatever `glob_paths.next()` gives.
                                     // If it's a directory, return its status. The user can use another glob
                                     // if they want to see inside. This aligns with how `ls` works with globs in shells.
-                                    return Some(Ok(file_status));
+                                    Some(Ok(file_status))
                                 } else {
                                     // It's a file, return its status
-                                    return Some(Ok(file_status));
+                                    Some(Ok(file_status))
                                 }
                             }
-                            None => return Some(Err(HdfsError::FileNotFound(path_owned))),
+                            None => Some(Err(HdfsError::FileNotFound(path_owned))),
                         }
                     }
-                    Err(e) => return Some(Err(e)),
+                    Err(e) => Some(Err(e)),
                 }
             }
             Some(Err(glob_error)) => {
                 // Error from the globber itself during iteration
                 // glob_error.to_string() often includes the problematic path or pattern part.
-                return Some(Err(HdfsError::InvalidArgument(format!("Error during glob iteration: {}", glob_error.to_string()))));
+                Some(Err(HdfsError::InvalidArgument(format!("Error during glob iteration: {}", glob_error))))
             }
             None => {
                 // Glob iterator is exhausted
-                return None;
+                None
             }
         }
     }

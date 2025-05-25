@@ -2,22 +2,23 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
-use futures::{stream, StreamExt};
+use futures::{stream, StreamExt, Future};
 use url::Url;
 
 use crate::acl::{AclEntry, AclStatus};
 use crate::common::config::{self, Configuration};
 use crate::ec::resolve_ec_policy;
-use crate::error::{HdfsError, Result};
+use crate::error::{HdfsError, Result}; // HdfsError is imported here
 use crate::file::{FileReader, FileWriter};
 use crate::hdfs::protocol::NamenodeProtocol;
 use crate::hdfs::proxy::NameServiceProxy;
 use crate::proto::hdfs::hdfs_file_status_proto::FileType;
 
+// No longer needed: crate::error::HdfsError (duplicate)
+// No longer needed: ::glob::{GlobError};
+// No longer needed: std::path::PathBuf;
 use crate::proto::hdfs::{ContentSummaryProto, HdfsFileStatusProto};
-use crate::error::HdfsError;
-use ::glob::{glob as glob_lib, Paths as GlobPaths, GlobError};
-use std::path::PathBuf;
+use ::glob::{glob as glob_lib, Paths as GlobPaths};
 
 #[derive(Clone)]
 pub struct WriteOptions {
@@ -579,13 +580,14 @@ pub struct ListStatusGlobIterator {
 
 impl ListStatusGlobIterator {
     fn new(pattern: String, mount_table: Arc<MountTable>, config: Arc<Configuration>) -> Result<Self> {
-        let glob_pattern = if !pattern.starts_with("/") {
+        let glob_pattern_orig = pattern.clone(); // Keep original for error message
+        let glob_pattern_str = if !pattern.starts_with("/") {
              return Err(HdfsError::InvalidArgument("Relative glob patterns are not supported. Please use absolute paths starting with '/'.".to_string()));
         } else {
             pattern
         };
 
-        let glob_paths = glob_lib(&glob_pattern).map_err(|e| HdfsError::ExternalLibraryError("Glob".to_string(), e.to_string()))?;
+        let glob_paths = glob_lib(&glob_pattern_str).map_err(|e| HdfsError::InvalidArgument(format!("Invalid glob pattern: '{}', error: {}", glob_pattern_orig, e.to_string())))?;
 
         Ok(ListStatusGlobIterator {
             mount_table,
@@ -680,8 +682,9 @@ impl ListStatusGlobIterator {
                 }
             }
             Some(Err(glob_error)) => {
-                // Error from the globber itself
-                return Some(Err(HdfsError::ExternalLibraryError("Glob".to_string(), glob_error.to_string())));
+                // Error from the globber itself during iteration
+                // glob_error.to_string() often includes the problematic path or pattern part.
+                return Some(Err(HdfsError::InvalidArgument(format!("Error during glob iteration: {}", glob_error.to_string()))));
             }
             None => {
                 // Glob iterator is exhausted
@@ -913,7 +916,7 @@ mod test {
     };
 
     use super::{MountLink, MountTable};
-    use crate::ClientBuilder;
+    // ClientBuilder import removed
 
     fn create_protocol(url: &str) -> Arc<NamenodeProtocol> {
         let proxy =

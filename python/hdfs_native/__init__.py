@@ -136,6 +136,13 @@ class Client:
         """Gets the status of files rooted at `path`. If `recursive` is true, lists all files recursively."""
         return self.inner.list_status(path, recursive)
 
+    def list_status_glob(self, path: str) -> Iterator[FileStatus]:
+        """
+        Lists files and directories based on a glob pattern.
+        The path must be absolute.
+        """
+        return self.inner.list_status_glob(path)
+
     def read(self, path: str) -> FileReader:
         """Opens a file for reading at `path`"""
         return FileReader(self.inner.read(path))

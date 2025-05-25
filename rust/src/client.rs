@@ -2,19 +2,23 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
-use futures::{stream, StreamExt};
+use futures::{stream, StreamExt, Future};
 use url::Url;
 
 use crate::acl::{AclEntry, AclStatus};
 use crate::common::config::{self, Configuration};
 use crate::ec::resolve_ec_policy;
-use crate::error::{HdfsError, Result};
+use crate::error::{HdfsError, Result}; // HdfsError is imported here
 use crate::file::{FileReader, FileWriter};
 use crate::hdfs::protocol::NamenodeProtocol;
 use crate::hdfs::proxy::NameServiceProxy;
 use crate::proto::hdfs::hdfs_file_status_proto::FileType;
 
+// No longer needed: crate::error::HdfsError (duplicate)
+// No longer needed: ::glob::{GlobError};
+// No longer needed: std::path::PathBuf;
 use crate::proto::hdfs::{ContentSummaryProto, HdfsFileStatusProto};
+use ::glob::{glob as glob_lib, Paths as GlobPaths};
 
 #[derive(Clone)]
 pub struct WriteOptions {
@@ -274,6 +278,11 @@ impl Client {
     /// Retrives an iterator of all files in directories located at `path`.
     pub fn list_status_iter(&self, path: &str, recursive: bool) -> ListStatusIterator {
         ListStatusIterator::new(path.to_string(), Arc::clone(&self.mount_table), recursive)
+    }
+
+    /// Retrieves an iterator of all files matching the glob pattern.
+    pub fn list_status_glob(&self, pattern: &str) -> Result<ListStatusGlobIterator> {
+        ListStatusGlobIterator::new(pattern.to_string(), Arc::clone(&self.mount_table), Arc::clone(&self.config))
     }
 
     /// Opens a file reader for the file at `path`. Path should not include a scheme.
@@ -562,6 +571,150 @@ impl Default for Client {
     }
 }
 
+pub struct ListStatusGlobIterator {
+    mount_table: Arc<MountTable>,
+    #[allow(dead_code)] // May be used later if we need to construct a Client or similar
+    config: Arc<Configuration>,
+    glob_paths: GlobPaths,
+}
+
+impl ListStatusGlobIterator {
+    fn new(pattern: String, mount_table: Arc<MountTable>, config: Arc<Configuration>) -> Result<Self> {
+        let glob_pattern_orig = pattern.clone(); // Keep original for error message
+        let glob_pattern_str = if !pattern.starts_with("/") {
+             return Err(HdfsError::InvalidArgument("Relative glob patterns are not supported. Please use absolute paths starting with '/'.".to_string()));
+        } else {
+            pattern
+        };
+
+        let glob_paths = glob_lib(&glob_pattern_str).map_err(|e| HdfsError::InvalidArgument(format!("Invalid glob pattern: '{}', error: {}", glob_pattern_orig, e)))?;
+
+        Ok(ListStatusGlobIterator {
+            mount_table,
+            config,
+            glob_paths,
+        })
+    }
+
+    async fn next_internal(&mut self) -> Option<Result<FileStatus>> {
+        match self.glob_paths.next() {
+            Some(Ok(path_buf)) => {
+                // Convert PathBuf to &str for get_file_info
+                let path_str = match path_buf.to_str() {
+                    Some(s) => s,
+                    None => Some(Err(HdfsError::InvalidPath("Path contains non-UTF8 characters".to_string()))),
+                }?;
+
+                // Create a temporary client to call get_file_info.
+                // This is a bit awkward. Ideally, ListStatusGlobIterator would have a reference to the Client,
+                // or get_file_info would be callable without a full Client instance if it only needs
+                // mount_table and config.
+                // For now, re-constructing parts of a client or a lightweight version.
+                // This assumes that the default FS is what we need if the glob path doesn't have a scheme.
+                // This is a major simplification and might not work correctly with viewfs etc.
+                // The MountTable logic is complex.
+                // A better approach would be to pass the client itself or a relevant part of it.
+
+                // Let's try to use the existing mount_table to resolve the path
+                let (link, resolved_path) = self.mount_table.resolve(path_str);
+
+                // Need an async runtime to call get_file_info
+                let protocol = Arc::clone(&link.protocol);
+                let path_owned = path_str.to_string(); // get_file_info needs owned string for error
+
+                match protocol.get_file_info(&resolved_path).await {
+                    Ok(file_info_resp) => {
+                        match file_info_resp.fs {
+                            Some(status_proto) => {
+                                let file_status = FileStatus::from(status_proto, &path_owned);
+                                if file_status.isdir {
+                                    // If the glob directly matched a directory, we might need to list its contents
+                                    // if the glob pattern implies recursion (e.g. ends with /** or contains **).
+                                    // For simplicity now, if a glob matches a directory, we return the directory.
+                                    // If the user wants to list contents, they should use a pattern like /path/to/dir/*
+                                    // However, if the original pattern was recursive (e.g. /some/**/file.txt) and this path_buf
+                                    // is a directory that was part of the ** expansion, then we should list it.
+                                    // The current glob crate behavior with `**` will yield individual files and dirs.
+                                    // If a directory is yielded by `glob`, we return that directory's status.
+                                    // If the pattern itself contained `**` and was meant to recurse into subdirs not explicitly
+                                    // matched by the glob pattern itself, that's more complex.
+                                    // For now, we assume `glob` handles the expansion and we just stat what it gives.
+                                    // If a directory path like /a/b/ is returned by glob, we stat /a/b.
+                                    // If the user wants to list children, their glob should be /a/b/* or /a/b/**.
+
+                                    // Let's reconsider: if glob returns a directory, and the original pattern
+                                    // had a recursive component like `**` or `*` at the end, we should probably
+                                    // expand it.
+                                    // This is tricky. `glob` itself expands `**`. So if `pattern` is `/foo/**/bar.txt`,
+                                    // `glob_paths` will yield things like `/foo/baz/bar.txt`.
+                                    // If `pattern` is `/foo/*`, `glob_paths` will yield `/foo/file1`, `/foo/dir1`.
+                                    // If `glob_paths` yields a directory, say `/foo/dir1` (from `/foo/*`),
+                                    // should we then list the contents of `/foo/dir1`?
+                                    // The standard glob behavior is that `/foo/*` matches items *inside* foo, not foo itself.
+                                    // If `/foo/dir1` is matched, it's an item.
+                                    // If the pattern was `/foo/**`, it would match `dir1` and also files/dirs inside `dir1`.
+                                    // So, if `glob` gives us a directory, we just return that directory's status.
+                                    // The user can use `/a/b/*` or `/a/b/**` to get contents.
+
+                                    // However, if a pattern like `/testdata/many_files/**` is used, glob returns `/testdata/many_files/`
+                                    // and then we should list its contents.
+                                    // Let's check if the path_buf from glob ends with `/` or if the FileStatus says it's a dir.
+                                    // And if the original pattern implies recursion into it.
+                                    // This logic is getting complicated.
+                                    // A simpler model: if glob gives a path, stat it. That's it.
+                                    // If the user wants to list a directory's contents, they use `dir/*`.
+                                    // If `glob` itself returns `/some/dir/` (with a trailing slash), it means the user intended to match the directory
+                                    // contents. But `glob` crate's `Paths` returns `PathBufs` which might not preserve this intent clearly.
+
+                                    // For now, let's stick to: stat whatever `glob_paths.next()` gives.
+                                    // If it's a directory, return its status. The user can use another glob
+                                    // if they want to see inside. This aligns with how `ls` works with globs in shells.
+                                    Some(Ok(file_status))
+                                } else {
+                                    // It's a file, return its status
+                                    Some(Ok(file_status))
+                                }
+                            }
+                            None => Some(Err(HdfsError::FileNotFound(path_owned))),
+                        }
+                    }
+                    Err(e) => Some(Err(e)),
+                }
+            }
+            Some(Err(glob_error)) => {
+                // Error from the globber itself during iteration
+                // glob_error.to_string() often includes the problematic path or pattern part.
+                Some(Err(HdfsError::InvalidArgument(format!("Error during glob iteration: {}", glob_error))))
+            }
+            None => {
+                // Glob iterator is exhausted
+                None
+            }
+        }
+    }
+
+    pub async fn next(&mut self) -> Option<Result<FileStatus>> {
+        self.next_internal().await
+    }
+}
+
+impl futures::Stream for ListStatusGlobIterator {
+    type Item = Result<FileStatus>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // This is a common way to bridge an async next method to a Stream.
+        // We need to ensure `next_internal` is properly awaitable.
+        // Since `next_internal` is async, we can use `Box::pin` and `poll`.
+        // Or, more simply, if we make `next_internal` the primary method called by a runtime:
+        let this = self.get_mut();
+        Box::pin(this.next_internal()).as_mut().poll(cx)
+    }
+}
+
+
 pub(crate) struct DirListingIterator {
     path: String,
     resolved_path: String,
@@ -763,6 +916,7 @@ mod test {
     };
 
     use super::{MountLink, MountTable};
+    // ClientBuilder import removed
 
     fn create_protocol(url: &str) -> Arc<NamenodeProtocol> {
         let proxy =

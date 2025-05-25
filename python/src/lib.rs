@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use ::hdfs_native::file::{FileReader, FileWriter};
 use ::hdfs_native::WriteOptions;
 use ::hdfs_native::{
-    client::{FileStatus, ListStatusIterator},
+    client::{FileStatus, ListStatusGlobIterator, ListStatusIterator},
     Client,
 };
 use bytes::Bytes;
@@ -439,6 +439,20 @@ impl RawClient {
         }
     }
 
+    pub fn list_status_glob(&self, path: &str, py: Python) -> PyHdfsResult<PyFileStatusGlobIter> {
+        // Allow threads to avoid blocking the GIL while making the call to Rust
+        let glob_iter_result = py.allow_threads(|| self.inner.list_status_glob(path));
+        
+        // Process the result of the potentially blocking operation
+        match glob_iter_result {
+            Ok(glob_iter) => Ok(PyFileStatusGlobIter {
+                inner: Arc::new(glob_iter),
+                rt: Arc::clone(&self.rt),
+            }),
+            Err(err) => Err(PythonHdfsError::from(err)),
+        }
+    }
+
     pub fn read(&self, path: &str, py: Python) -> PyHdfsResult<RawFileReader> {
         let file_reader = py.allow_threads(|| self.rt.block_on(self.inner.read(path)))?;
 
@@ -589,5 +603,31 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWriteOptions>()?;
     m.add_class::<PyAclEntry>()?;
     m.add_class::<PyAclStatus>()?;
+    m.add_class::<PyFileStatusGlobIter>()?;
     Ok(())
+}
+
+#[pyclass(name = "FileStatusGlobIter")]
+struct PyFileStatusGlobIter {
+    inner: Arc<ListStatusGlobIterator>,
+    rt: Arc<Runtime>,
+}
+
+#[pymethods]
+impl PyFileStatusGlobIter {
+    pub fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(slf: PyRefMut<'_, Self>) -> PyHdfsResult<Option<PyFileStatus>> {
+        let inner = Arc::clone(&slf.inner);
+        let rt = Arc::clone(&slf.rt);
+        // Use slf.py().allow_threads to release the GIL
+        let result = slf.py().allow_threads(|| rt.block_on(inner.next()));
+        match result {
+            Some(Ok(status)) => Ok(Some(PyFileStatus::from(status))),
+            Some(Err(err)) => Err(PythonHdfsError::from(err)),
+            None => Ok(None),
+        }
+    }
 }

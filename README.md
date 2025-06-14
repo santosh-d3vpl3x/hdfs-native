@@ -15,6 +15,7 @@ Here is a list of currently supported and unsupported but possible future featur
 - [x] Content summary
 - [x] Set replication
 - [x] Set timestamps
+- [x] Glob pattern matching with brace expansion
 
 ### HDFS Features
 - [x] Name Services

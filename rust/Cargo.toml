@@ -24,6 +24,7 @@ des = "0.8"
 dns-lookup = "2"
 futures = { workspace = true }
 g2p = "1"
+fast-glob = "0.4"
 hex = "0.4"
 hmac = "0.12"
 libc = "0.2"

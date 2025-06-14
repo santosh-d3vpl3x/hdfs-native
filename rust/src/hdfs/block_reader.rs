@@ -201,11 +201,7 @@ impl ReplicatedBlockStream {
             }
         };
 
-        let packet_offset = if self.offset > header.offset_in_block as usize {
-            self.offset - header.offset_in_block as usize
-        } else {
-            0
-        };
+        let packet_offset = self.offset.saturating_sub(header.offset_in_block as usize);
         let packet_len = usize::min(header.data_len as usize - packet_offset, self.len);
 
         self.offset += packet_len;

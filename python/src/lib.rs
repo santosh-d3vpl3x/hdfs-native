@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use ::hdfs_native::file::{FileReader, FileWriter};
 use ::hdfs_native::WriteOptions;
 use ::hdfs_native::{
-    client::{FileStatus, ListStatusIterator},
+    client::{FileStatus, GlobListStatusIterator, ListStatusIterator},
     Client,
 };
 use bytes::Bytes;
@@ -219,6 +219,32 @@ impl PyAclEntry {
             "AclEntry(type='{}', scope='{}', permissions='{}', name='{:?}')",
             self.r#type, self.scope, self.permissions, self.name
         )
+    }
+}
+
+#[pyclass(name = "GlobFileStatusIter")]
+struct PyGlobFileStatusIter {
+    inner: Arc<Mutex<GlobListStatusIterator>>,
+    rt: Arc<Runtime>,
+}
+
+#[pymethods]
+impl PyGlobFileStatusIter {
+    pub fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(slf: PyRefMut<'_, Self>) -> PyHdfsResult<Option<PyFileStatus>> {
+        let inner = Arc::clone(&slf.inner);
+        let rt = Arc::clone(&slf.rt);
+        if let Some(result) = slf.py().allow_threads(|| {
+            let mut guard = inner.lock().unwrap();
+            rt.block_on(guard.next())
+        }) {
+            Ok(Some(PyFileStatus::from(result?)))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -439,6 +465,14 @@ impl RawClient {
         }
     }
 
+    pub fn glob_list_status_iter(&self, pattern: &str) -> PyHdfsResult<PyGlobFileStatusIter> {
+        let inner = self.inner.glob_list_status_iter(pattern)?;
+        Ok(PyGlobFileStatusIter {
+            inner: Arc::new(Mutex::new(inner)),
+            rt: Arc::clone(&self.rt),
+        })
+    }
+
     pub fn read(&self, path: &str, py: Python) -> PyHdfsResult<RawFileReader> {
         let file_reader = py.allow_threads(|| self.rt.block_on(self.inner.read(path)))?;
 
@@ -585,6 +619,7 @@ impl RawClient {
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RawClient>()?;
     m.add_class::<PyFileStatus>()?;
+    m.add_class::<PyGlobFileStatusIter>()?;
     m.add_class::<PyContentSummary>()?;
     m.add_class::<PyWriteOptions>()?;
     m.add_class::<PyAclEntry>()?;

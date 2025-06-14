@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use fast_glob::glob_match;
 use futures::stream::BoxStream;
 use futures::{stream, StreamExt};
 use url::Url;
@@ -274,6 +275,45 @@ impl Client {
     /// Retrives an iterator of all files in directories located at `path`.
     pub fn list_status_iter(&self, path: &str, recursive: bool) -> ListStatusIterator {
         ListStatusIterator::new(path.to_string(), Arc::clone(&self.mount_table), recursive)
+    }
+
+    /// Returns files matching a glob pattern using memory-efficient DFS traversal.
+    ///
+    /// The pattern supports standard glob syntax:
+    /// - `*` matches any sequence of characters except `/`
+    /// - `**` matches any sequence of characters including `/` (recursive)
+    /// - `?` matches any single character except `/`
+    /// - `[abc]` matches any character in the set
+    /// - `{a,b,c}` matches any of the patterns (alternation)
+    ///
+    /// Pattern must be absolute (start with `/`).
+    pub async fn glob_list_status(&self, pattern: &str) -> Result<Vec<FileStatus>> {
+        let iter = self.glob_list_status_iter(pattern)?;
+        let statuses = iter
+            .into_stream()
+            .collect::<Vec<Result<FileStatus>>>()
+            .await;
+
+        let mut resolved_statuses = Vec::<FileStatus>::with_capacity(statuses.len());
+        for status in statuses.into_iter() {
+            resolved_statuses.push(status?);
+        }
+
+        Ok(resolved_statuses)
+    }
+
+    /// Returns an iterator of files matching a glob pattern using memory-efficient DFS traversal.
+    ///
+    /// The pattern supports standard glob syntax:
+    /// - `*` matches any sequence of characters except `/`
+    /// - `**` matches any sequence of characters including `/` (recursive)
+    /// - `?` matches any single character except `/`
+    /// - `[abc]` matches any character in the set
+    /// - `{a,b,c}` matches any of the patterns (alternation)
+    ///
+    /// Pattern must be absolute (start with `/`).
+    pub fn glob_list_status_iter(&self, pattern: &str) -> Result<GlobListStatusIterator> {
+        GlobListStatusIterator::new(pattern.to_string(), Arc::clone(&self.mount_table))
     }
 
     /// Opens a file reader for the file at `path`. Path should not include a scheme.
@@ -689,6 +729,84 @@ impl ListStatusIterator {
     }
 }
 
+/// Determines the base directory and whether recursive traversal is needed for a glob pattern
+pub fn parse_glob_pattern(pattern: &str) -> Result<(String, bool)> {
+    if !pattern.starts_with('/') {
+        return Err(HdfsError::InvalidArgument(
+            "Glob pattern must be absolute (start with /)".to_string(),
+        ));
+    }
+
+    // Find the first directory that doesn't contain glob metacharacters
+    let segments: Vec<&str> = pattern.trim_start_matches('/').split('/').collect();
+    let mut base_path = String::from("/");
+    let mut needs_recursive = false;
+
+    for segment in segments {
+        if segment.contains('*')
+            || segment.contains('?')
+            || segment.contains('[')
+            || segment.contains('{')
+        {
+            needs_recursive = true;
+            break;
+        }
+        if !base_path.ends_with('/') && base_path != "/" {
+            base_path.push('/');
+        }
+        base_path.push_str(segment);
+    }
+
+    // If pattern contains **, we need recursive search
+    if pattern.contains("**") {
+        needs_recursive = true;
+    }
+
+    // Remove trailing slash unless it's root
+    if base_path != "/" && base_path.ends_with('/') {
+        base_path.pop();
+    }
+
+    Ok((base_path, needs_recursive))
+}
+
+pub struct GlobListStatusIterator {
+    inner: ListStatusIterator,
+    pattern: String,
+}
+
+impl GlobListStatusIterator {
+    fn new(pattern: String, mount_table: Arc<MountTable>) -> Result<Self> {
+        let (base_path, recursive) = parse_glob_pattern(&pattern)?;
+        let inner = ListStatusIterator::new(base_path, mount_table, recursive);
+
+        Ok(GlobListStatusIterator { inner, pattern })
+    }
+
+    pub async fn next(&mut self) -> Option<Result<FileStatus>> {
+        while let Some(file_result) = self.inner.next().await {
+            match file_result {
+                Ok(file) => {
+                    // Check if this file matches the pattern using fast_glob
+                    if glob_match(&self.pattern, &file.path) {
+                        return Some(Ok(file));
+                    }
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        None
+    }
+
+    pub fn into_stream(self) -> BoxStream<'static, Result<FileStatus>> {
+        let listing = stream::unfold(self, |mut state| async move {
+            let next = state.next().await;
+            next.map(|n| (n, state))
+        });
+        Box::pin(listing)
+    }
+}
+
 #[derive(Debug)]
 pub struct FileStatus {
     pub path: String,
@@ -881,5 +999,239 @@ mod test {
         let (link, resolved) = mount_table.resolve("/mount3/nested/file");
         assert_eq!(link.viewfs_path, "/mount3/nested");
         assert_eq!(resolved, "/path3/file");
+    }
+
+    #[cfg(test)]
+    mod glob_tests {
+        use super::super::parse_glob_pattern;
+        use fast_glob::glob_match;
+
+        #[test]
+        fn test_basic_brace_expansion() {
+            // Test basic brace expansion patterns
+            assert!(glob_match("/target/{aes,glob}-123", "/target/aes-123"));
+            assert!(glob_match("/target/{aes,glob}-123", "/target/glob-123"));
+            assert!(!glob_match("/target/{aes,glob}-123", "/target/bytes-123"));
+            assert!(!glob_match("/target/{aes,glob}-123", "/target/aes-456"));
+        }
+
+        #[test]
+        fn test_brace_expansion_with_wildcards() {
+            // Test braces combined with wildcards
+            assert!(glob_match(
+                "/target/{aes,glob}-*",
+                "/target/aes-2bb9b15fd6331c4b"
+            ));
+            assert!(glob_match(
+                "/target/{aes,glob}-*",
+                "/target/glob-155215014fe729c5"
+            ));
+            assert!(glob_match("/target/{*.json,*.so}", "/target/file.json"));
+            assert!(glob_match("/target/{*.json,*.so}", "/target/library.so"));
+            assert!(!glob_match("/target/{*.json,*.so}", "/target/file.rlib"));
+        }
+
+        #[test]
+        fn test_nested_brace_expansion() {
+            // Test nested braces
+            assert!(glob_match("/target/{a{1,2},b{3,4}}", "/target/a1"));
+            assert!(glob_match("/target/{a{1,2},b{3,4}}", "/target/a2"));
+            assert!(glob_match("/target/{a{1,2},b{3,4}}", "/target/b3"));
+            assert!(glob_match("/target/{a{1,2},b{3,4}}", "/target/b4"));
+            assert!(!glob_match("/target/{a{1,2},b{3,4}}", "/target/a3"));
+            assert!(!glob_match("/target/{a{1,2},b{3,4}}", "/target/c1"));
+        }
+
+        #[test]
+        fn test_character_classes() {
+            // Test character classes (brackets)
+            assert!(glob_match("/target/[abc]*", "/target/aes-123"));
+            assert!(glob_match("/target/[abc]*", "/target/bytes-456"));
+            assert!(glob_match("/target/[abc]*", "/target/cfg-789"));
+            assert!(!glob_match("/target/[abc]*", "/target/des-123"));
+
+            // Character class ranges
+            assert!(glob_match("/target/[a-c]*", "/target/aes"));
+            assert!(glob_match("/target/[a-c]*", "/target/bytes"));
+            assert!(glob_match("/target/[a-c]*", "/target/cfg"));
+            assert!(!glob_match("/target/[a-c]*", "/target/des"));
+        }
+
+        #[test]
+        fn test_character_classes_with_braces() {
+            // Test combined character classes and brace expansion
+            assert!(glob_match("/target/{[ab]*,[cd]*}", "/target/aes-123"));
+            assert!(glob_match("/target/{[ab]*,[cd]*}", "/target/bytes-456"));
+            assert!(glob_match("/target/{[ab]*,[cd]*}", "/target/cfg-789"));
+            assert!(glob_match("/target/{[ab]*,[cd]*}", "/target/des-012"));
+            assert!(!glob_match("/target/{[ab]*,[cd]*}", "/target/xyz-345"));
+        }
+
+        #[test]
+        fn test_recursive_patterns() {
+            // Test recursive wildcards with braces
+            assert!(glob_match(
+                "/target/**/{*.json,*.so}",
+                "/target/debug/lib.json"
+            ));
+            assert!(glob_match(
+                "/target/**/{*.json,*.so}",
+                "/target/deep/nested/file.so"
+            ));
+            assert!(glob_match(
+                "/target/**/{*.json,*.so}",
+                "/target/a/b/c/d/file.json"
+            ));
+            assert!(!glob_match("/target/**/{*.json,*.so}", "/target/file.rlib"));
+        }
+
+        #[test]
+        fn test_complex_fingerprint_patterns() {
+            // Test realistic HDFS fingerprint patterns from our test suite
+            let pattern = "/target/**/debug/.fingerprint/{aes,glob,bytes}-*";
+            assert!(glob_match(
+                pattern,
+                "/target/target/debug/.fingerprint/aes-2bb9b15fd6331c4b"
+            ));
+            assert!(glob_match(
+                pattern,
+                "/target/target/debug/.fingerprint/glob-155215014fe729c5"
+            ));
+            assert!(glob_match(
+                pattern,
+                "/target/target/debug/.fingerprint/bytes-43204654ee7f1c02"
+            ));
+            assert!(!glob_match(
+                pattern,
+                "/target/target/debug/.fingerprint/chrono-98d11b68903789b9"
+            ));
+        }
+
+        #[test]
+        fn test_mixed_extension_patterns() {
+            // Test complex extension matching
+            let pattern = "/target/**/{*.{json,so},*[0-9]*.{rlib,d}}";
+            assert!(glob_match(pattern, "/target/file.json"));
+            assert!(glob_match(pattern, "/target/library.so"));
+            assert!(glob_match(pattern, "/target/lib123.rlib"));
+            assert!(glob_match(pattern, "/target/dep456.d"));
+            assert!(!glob_match(pattern, "/target/simple.rlib")); // No digit
+            assert!(!glob_match(pattern, "/target/file.txt")); // Wrong extension
+        }
+
+        #[test]
+        fn test_library_type_patterns() {
+            // Test library-specific patterns
+            let pattern = "/target/**/debug/.fingerprint/*/{{lib,bin,test}-[abc]*,{dep,invoked}*}";
+            assert!(glob_match(
+                pattern,
+                "/target/debug/.fingerprint/crate/lib-aes"
+            ));
+            assert!(glob_match(
+                pattern,
+                "/target/debug/.fingerprint/crate/bin-bytes"
+            ));
+            assert!(glob_match(
+                pattern,
+                "/target/debug/.fingerprint/crate/test-cfg"
+            ));
+            assert!(glob_match(
+                pattern,
+                "/target/debug/.fingerprint/crate/dep-lib-aes"
+            ));
+            assert!(glob_match(
+                pattern,
+                "/target/debug/.fingerprint/crate/invoked.timestamp"
+            ));
+            assert!(!glob_match(
+                pattern,
+                "/target/debug/.fingerprint/crate/lib-xyz"
+            )); // Not [abc]
+        }
+
+        #[test]
+        fn test_negation_patterns() {
+            // Test character class negation
+            assert!(glob_match("/target/[!z]*", "/target/aes-123"));
+            assert!(glob_match("/target/[!z]*", "/target/glob-456"));
+            assert!(!glob_match("/target/[!z]*", "/target/zig-789"));
+        }
+
+        #[test]
+        fn test_hex_patterns() {
+            // Test hexadecimal character patterns
+            let pattern = "/target/**/[a-z]*-[0-9a-f][0-9a-f][0-9a-f]*";
+            assert!(glob_match(pattern, "/target/debug/aes-2bb9b15fd6331c4b"));
+            assert!(glob_match(pattern, "/target/debug/glob-155215014fe729c5"));
+            assert!(glob_match(pattern, "/target/debug/bytes-43204654ee7f1c02"));
+            assert!(!glob_match(pattern, "/target/debug/AES-2bb9b15fd6331c4b")); // Uppercase
+            assert!(!glob_match(pattern, "/target/debug/aes-xyz")); // Non-hex
+        }
+
+        #[test]
+        fn test_case_insensitive_extensions() {
+            // Test case variations in extensions
+            let pattern = "/target/**/*.{[jJ][sS][oO][nN],[sS][oO],[rR][lL][iI][bB]}";
+            assert!(glob_match(pattern, "/target/file.json"));
+            assert!(glob_match(pattern, "/target/file.JSON"));
+            assert!(glob_match(pattern, "/target/file.Json"));
+            assert!(glob_match(pattern, "/target/lib.so"));
+            assert!(glob_match(pattern, "/target/lib.SO"));
+            assert!(glob_match(pattern, "/target/lib.rlib"));
+            assert!(glob_match(pattern, "/target/lib.RLIB"));
+            assert!(!glob_match(pattern, "/target/file.txt"));
+        }
+
+        #[test]
+        fn test_edge_cases() {
+            // Test edge cases and special characters
+            assert!(glob_match("/target/{}", "/target/")); // Empty braces
+            assert!(glob_match("/target/{a}", "/target/a")); // Single option
+            assert!(glob_match("/target/{a,}", "/target/a")); // Trailing comma
+            assert!(glob_match("/target/{a,}", "/target/")); // Empty option
+
+            // Test escaping
+            assert!(glob_match(
+                "/target/file\\{not_brace\\}",
+                "/target/file{not_brace}"
+            ));
+        }
+
+        #[test]
+        fn test_parse_glob_pattern() {
+            // Test the parse_glob_pattern function
+            let (base, recursive) = parse_glob_pattern("/target/**/*.json").unwrap();
+            assert_eq!(base, "/target");
+            assert!(recursive);
+
+            let (base, recursive) = parse_glob_pattern("/target/*.json").unwrap();
+            assert_eq!(base, "/target");
+            assert!(recursive); // Any glob pattern requires recursive search
+
+            let (base, recursive) = parse_glob_pattern("/target/specific/file.json").unwrap();
+            assert_eq!(base, "/target/specific/file.json"); // No glob chars, so full path is base
+            assert!(!recursive);
+
+            let (base, recursive) = parse_glob_pattern("/target/{aes,glob}/**/*.json").unwrap();
+            assert_eq!(base, "/target");
+            assert!(recursive);
+        }
+
+        #[test]
+        fn test_performance_patterns() {
+            // Test patterns that should be efficient
+            let large_brace_pattern =
+                "/target/{a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z}*";
+            assert!(glob_match(large_brace_pattern, "/target/aes-123"));
+            assert!(glob_match(large_brace_pattern, "/target/zig-789"));
+            assert!(!glob_match(large_brace_pattern, "/target/123-abc"));
+
+            // Test deeply nested patterns
+            let nested_pattern = "/target/{a{1{i,ii},2{i,ii}},b{1{i,ii},2{i,ii}}}";
+            assert!(glob_match(nested_pattern, "/target/a1i"));
+            assert!(glob_match(nested_pattern, "/target/a1ii"));
+            assert!(glob_match(nested_pattern, "/target/b2i"));
+            assert!(!glob_match(nested_pattern, "/target/c1i"));
+        }
     }
 }

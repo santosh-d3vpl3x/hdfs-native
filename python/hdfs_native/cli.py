@@ -9,7 +9,7 @@ from argparse import ArgumentParser, Namespace
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Generator, List, Optional, Sequence, Tuple, Union
 from urllib.parse import urlparse
 
 from hdfs_native import Client
@@ -66,9 +66,19 @@ def _path_for_url(url: str) -> str:
     return urlparse(url).path
 
 
-def _glob_path(client: Client, glob: str) -> List[str]:
-    # TODO: Actually implement this, for now just pretend we have multiple results
-    return [glob]
+def _glob_path(client: Client, glob_pattern: str) -> Generator:
+    """
+    Resolve a glob pattern to a list of matching paths.
+
+    Args:
+        client: HDFS client instance
+        glob_pattern: Glob pattern (supports *, **, ?, [abc], {a,b})
+
+    Returns:
+        List of matching file paths
+    """
+    for file_status in client.glob_list_status_iter(glob_pattern):
+        yield file_status.path
 
 
 def _glob_local_path(glob_pattern: str) -> List[str]:
@@ -591,7 +601,7 @@ def touch(args: Namespace):
 def main(in_args: Optional[Sequence[str]] = None):
     parser = ArgumentParser(
         description="""Command line utility for interacting with HDFS using hdfs-native.
-        Globs are not currently supported, all file paths are treated as exact paths."""
+        Supports glob patterns including: * (wildcard), ** (recursive), ? (single char), [abc] (char class), {a,b} (alternation)."""
     )
 
     subparsers = parser.add_subparsers(title="Subcommands", required=True)

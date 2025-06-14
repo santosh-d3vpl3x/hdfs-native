@@ -136,6 +136,25 @@ class Client:
         """Gets the status of files rooted at `path`. If `recursive` is true, lists all files recursively."""
         return self.inner.list_status(path, recursive)
 
+    def glob_list_status_iter(self, pattern: str) -> Iterator[FileStatus]:
+        """
+        Gets the status of files matching a glob pattern.
+
+        Supports glob patterns including:
+        - * matches any sequence of characters except /
+        - ** matches any sequence of characters including / (recursive)
+        - ? matches any single character except /
+        - [abc] matches any character in the set
+        - {a,b,c} matches any of the patterns (alternation)
+
+        Args:
+            pattern: Glob pattern to match (must be absolute path starting with /)
+
+        Returns:
+            Iterator of FileStatus objects for matching files
+        """
+        return self.inner.glob_list_status_iter(pattern)
+
     def read(self, path: str) -> FileReader:
         """Opens a file for reading at `path`"""
         return FileReader(self.inner.read(path))

@@ -60,6 +60,21 @@ mod test {
     async fn test_resync_after_resource_manager_restart() {
         let _ = env_logger::builder().is_test(true).try_init();
         let yarn = MiniYarn::with_features(&HashSet::from([YarnFeatures::Recovery]));
+        test_application_master_resync(|| yarn.restart_resource_manager()).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resource_manager_failover() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let yarn = MiniYarn::with_features(&HashSet::from([YarnFeatures::HA]));
+        test_application_master_resync(|| yarn.fail_over_resource_manager()).await;
+    }
+
+    /// Runs an unmanaged ApplicationMaster through `disrupt`, which makes the active
+    /// ResourceManager lose it, and checks that the clients find the active ResourceManager,
+    /// the ApplicationMaster resyncs and gets its container, and the application finishes.
+    async fn test_application_master_resync(disrupt: impl FnOnce()) {
         let client = YarnClientBuilder::new().build_async().await.unwrap();
 
         let application_id = submit_unmanaged(&client, "resync-test").await.unwrap();
@@ -76,7 +91,7 @@ mod test {
             .await
             .unwrap();
 
-        // The request reaches the ResourceManager, which then loses it in the restart
+        // The request reaches the ResourceManager, which then loses it
         let response = am
             .allocate(AllocateRequest {
                 asks: vec![ResourceRequest::new(0, Resource::new(128, 1), 1)],
@@ -87,7 +102,27 @@ mod test {
         assert!(!response.resynced);
         let mut containers = response.allocated_containers;
 
-        yarn.restart_resource_manager();
+        disrupt();
+
+        // The active ResourceManager recovered the application from the state store. It shows
+        // as accepted until the ApplicationMaster registers again.
+        let report = client.get_application_report(application_id).await.unwrap();
+        assert!(
+            matches!(
+                report.state,
+                ApplicationState::Accepted | ApplicationState::Running
+            ),
+            "{:?}",
+            report.state
+        );
+        assert_eq!(
+            client
+                .get_cluster_metrics()
+                .await
+                .unwrap()
+                .num_node_managers,
+            1
+        );
 
         // The first heartbeat finds the ResourceManager has lost the ApplicationMaster, so the
         // client registers again and re-sends the outstanding request

@@ -16,6 +16,8 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 const RESTART_TRIGGER: &str = "target/test/restart-rm";
 const RESTART_DONE: &str = "target/test/rm-restarted";
+const FAILOVER_TRIGGER: &str = "target/test/failover-rm";
+const FAILOVER_DONE: &str = "target/test/rm-failed-over";
 const RESTART_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -23,6 +25,9 @@ pub enum YarnFeatures {
     /// ResourceManager recovery with a state store on disk, so
     /// [`MiniYarn::restart_resource_manager`] keeps running applications.
     Recovery,
+    /// Two ResourceManagers, `rm0` (active) and `rm1`, sharing a recovery state store, so
+    /// [`MiniYarn::fail_over_resource_manager`] keeps running applications.
+    HA,
     /// Kerberos for the ResourceManager and NodeManager, plus a Kerberized HDFS at
     /// `hdfs://127.0.0.1:19000`. Clients authenticate as `yarn/localhost`.
     Security,
@@ -32,6 +37,7 @@ impl YarnFeatures {
     pub fn as_str(&self) -> &str {
         match self {
             YarnFeatures::Recovery => "recovery",
+            YarnFeatures::HA => "ha",
             YarnFeatures::Security => "security",
         }
     }
@@ -153,17 +159,37 @@ impl MiniYarn {
             self.features.contains(&YarnFeatures::Recovery),
             "restarting the ResourceManager needs YarnFeatures::Recovery"
         );
-        let _ = fs::remove_file(RESTART_DONE);
-        fs::write(RESTART_TRIGGER, b"").unwrap();
+        Self::trigger(
+            RESTART_TRIGGER,
+            RESTART_DONE,
+            "restarting the ResourceManager",
+        );
+    }
+
+    /// Makes `rm1` the active ResourceManager instead of `rm0` and waits until the
+    /// NodeManager has registered with it. The cluster must have [`YarnFeatures::HA`].
+    pub fn fail_over_resource_manager(&self) {
+        assert!(
+            self.features.contains(&YarnFeatures::HA),
+            "failing over the ResourceManager needs YarnFeatures::HA"
+        );
+        Self::trigger(
+            FAILOVER_TRIGGER,
+            FAILOVER_DONE,
+            "failing over the ResourceManager",
+        );
+    }
+
+    /// Asks the launcher to act by creating `trigger`, then waits for it to create `done`.
+    fn trigger(trigger: &str, done: &str, action: &str) {
+        let _ = fs::remove_file(done);
+        fs::write(trigger, b"").unwrap();
         let start = Instant::now();
-        while !Path::new(RESTART_DONE).exists() {
-            assert!(
-                start.elapsed() < RESTART_TIMEOUT,
-                "Timed out restarting the ResourceManager"
-            );
+        while !Path::new(done).exists() {
+            assert!(start.elapsed() < RESTART_TIMEOUT, "Timed out {action}");
             thread::sleep(Duration::from_millis(100));
         }
-        fs::remove_file(RESTART_DONE).unwrap();
+        fs::remove_file(done).unwrap();
     }
 }
 

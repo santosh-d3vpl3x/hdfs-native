@@ -6,7 +6,8 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 
-import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.ha.HAServiceProtocol.RequestSource;
+import org.apache.hadoop.ha.HAServiceProtocol.StateChangeRequestInfo;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
@@ -22,6 +23,9 @@ public class Main {
     // Tests ask for a ResourceManager restart by creating this file, and wait for the done file.
     private static final File RESTART_TRIGGER = new File("target/test/restart-rm");
     private static final File RESTART_DONE = new File("target/test/rm-restarted");
+    // With the ha flag, tests ask for a failover from rm0 to rm1 the same way.
+    private static final File FAILOVER_TRIGGER = new File("target/test/failover-rm");
+    private static final File FAILOVER_DONE = new File("target/test/rm-failed-over");
 
     public static void main(String args[]) throws Exception {
         Set<String> flags = new HashSet<>();
@@ -32,6 +36,10 @@ public class Main {
         new File("target/test").mkdirs();
         RESTART_TRIGGER.delete();
         RESTART_DONE.delete();
+        FAILOVER_TRIGGER.delete();
+        FAILOVER_DONE.delete();
+        boolean ha = flags.contains("ha");
+        boolean recovery = ha || flags.contains("recovery");
 
         YarnConfiguration conf = new YarnConfiguration();
 
@@ -88,9 +96,9 @@ public class Main {
         // Fail fast so tests don't wait for retries of an attempt
         conf.setInt(YarnConfiguration.RM_AM_MAX_ATTEMPTS, 1);
 
-        if (flags.contains("recovery")) {
-            // Keep application state on disk so a restarted ResourceManager recovers it, and
-            // keep containers running across the restart
+        if (recovery) {
+            // Keep application state on disk so a restarted or newly active ResourceManager
+            // recovers it, and keep containers running across the change
             File stateStore = new File("target/test/rm-state-store").getAbsoluteFile();
             deleteRecursively(stateStore);
             conf.setBoolean(YarnConfiguration.RECOVERY_ENABLED, true);
@@ -106,6 +114,26 @@ public class Main {
             // talking to the stopped instance. Over RPC it reconnects, which needs fixed ports.
             conf.setBoolean(YarnConfiguration.YARN_MINICLUSTER_USE_RPC, true);
             conf.setBoolean(YarnConfiguration.YARN_MINICLUSTER_FIXED_PORTS, true);
+        }
+        if (ha) {
+            // Two ResourceManagers sharing the state store. Without ZooKeeper there is no
+            // automatic failover, so tests switch the active one through the admin service.
+            conf.setBoolean(YarnConfiguration.AUTO_FAILOVER_ENABLED, false);
+            conf.set(YarnConfiguration.RM_HA_IDS, "rm0,rm1");
+            String[][] ports = {
+                {YarnConfiguration.RM_ADDRESS, "032"},
+                {YarnConfiguration.RM_SCHEDULER_ADDRESS, "030"},
+                {YarnConfiguration.RM_RESOURCE_TRACKER_ADDRESS, "031"},
+                {YarnConfiguration.RM_ADMIN_ADDRESS, "033"},
+                {YarnConfiguration.RM_WEBAPP_ADDRESS, "088"},
+                {YarnConfiguration.RM_WEBAPP_HTTPS_ADDRESS, "090"},
+            };
+            for (int i = 0; i < 2; i++) {
+                for (String[] port : ports) {
+                    conf.set(port[0] + ".rm" + i, "localhost:" + (18 + i * 10) + port[1]);
+                }
+            }
+        } else if (recovery) {
             conf.set(YarnConfiguration.RM_ADDRESS, "localhost:18032");
             conf.set(YarnConfiguration.RM_SCHEDULER_ADDRESS, "localhost:18030");
             conf.set(YarnConfiguration.RM_RESOURCE_TRACKER_ADDRESS, "localhost:18031");
@@ -113,7 +141,7 @@ public class Main {
             conf.set(YarnConfiguration.RM_WEBAPP_ADDRESS, "localhost:18088");
         }
 
-        MiniYARNCluster yarn = new MiniYARNCluster("yarn-native", 1, 1, 1);
+        MiniYARNCluster yarn = new MiniYARNCluster("yarn-native", ha ? 2 : 1, 1, 1, 1);
         yarn.init(conf);
         yarn.start();
         if (!yarn.waitForNodeManagersToConnect(60_000)) {
@@ -155,7 +183,7 @@ public class Main {
             }
         }, "miniyarn-shutdown"));
 
-        if (flags.contains("recovery")) {
+        if (recovery) {
             Thread restarter = new Thread(() -> watchForRestarts(shutdownYarn), "miniyarn-restarter");
             restarter.setDaemon(true);
             restarter.start();
@@ -173,6 +201,18 @@ public class Main {
     private static void watchForRestarts(MiniYARNCluster yarn) {
         while (true) {
             try {
+                if (FAILOVER_TRIGGER.delete()) {
+                    StateChangeRequestInfo request =
+                        new StateChangeRequestInfo(RequestSource.REQUEST_BY_USER_FORCED);
+                    yarn.getResourceManager(0).getRMContext().getRMAdminService()
+                        .transitionToStandby(request);
+                    yarn.getResourceManager(1).getRMContext().getRMAdminService()
+                        .transitionToActive(request);
+                    if (!yarn.waitForNodeManagersToConnect(60_000)) {
+                        throw new IllegalStateException("NodeManager did not register with rm1");
+                    }
+                    FAILOVER_DONE.createNewFile();
+                }
                 if (RESTART_TRIGGER.delete()) {
                     yarn.restartResourceManager(0);
                     if (!yarn.waitForNodeManagersToConnect(60_000)) {

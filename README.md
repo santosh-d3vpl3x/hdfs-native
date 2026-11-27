@@ -154,12 +154,15 @@ All other settings are generally assumed to be the defaults currently. Any setup
 cargo build
 ```
 
-The Rust implementation is split into two crates:
+The Rust implementation is split into three crates:
 
 - `rust/hadoop-native` contains reusable Hadoop configuration, common protobuf,
   authentication, and IPC/RPC functionality.
 - `rust/hdfs-native` contains the HDFS client, NameNode/DataNode protocols,
   glob handling, erasure coding, and filesystem APIs.
+- `rust/yarn-native` contains the YARN clients: `YarnClient` for the
+  ResourceManager's client protocol, `AmRmClient` for ApplicationMasters, and
+  `NmClient` for starting and stopping containers on NodeManagers.
 
 ## Object store implementation
 
@@ -174,6 +177,12 @@ cargo test -p hdfs-native --features integration-test
 ```
 
 Add `kms-rustls-tls` to the feature list to also run the encryption-zone (KMS) tests: `--features integration-test,kms-rustls-tls`.
+
+The YARN tests use a similar Java application in `rust/yarn-native/miniyarn/` that runs a `MiniYARNCluster`:
+
+```bash
+cargo test -p yarn-native --features integration-test
+```
 
 On macOS with Homebrew Kerberos, make sure the test binaries load Homebrew's
 GSSAPI library. This version supports credential stores used by the explicit

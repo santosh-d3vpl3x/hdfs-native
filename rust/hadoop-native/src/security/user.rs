@@ -35,20 +35,25 @@ struct TokenIdentifier {
 impl TryFrom<Vec<u8>> for TokenIdentifier {
     type Error = HdfsError;
 
+    /// Parses a Writable-encoded `AbstractDelegationTokenIdentifier`. Other token kinds, such as
+    /// YARN's protobuf-encoded identifiers, return an error rather than panicking.
     fn try_from(value: Vec<u8>) -> std::result::Result<Self, Self::Error> {
         let mut buf = Bytes::from(value);
+        ensure_remaining(&buf, 1)?;
         let version = buf.get_u8();
         if version != 0 {
-            panic!();
+            return Err(HdfsError::InvalidArgument(format!(
+                "unsupported delegation token identifier version {version}"
+            )));
         }
 
         let owner = parse_vint_string(&mut buf)?;
         let renewer = parse_vint_string(&mut buf)?;
         let real_user = parse_vint_string(&mut buf)?;
-        let issue_date = parse_vlong(&mut buf);
-        let max_date = parse_vlong(&mut buf);
-        let sequence_number = parse_vint(&mut buf);
-        let master_key_id = parse_vint(&mut buf);
+        let issue_date = parse_vlong(&mut buf)?;
+        let max_date = parse_vlong(&mut buf)?;
+        let sequence_number = parse_vint(&mut buf)?;
+        let master_key_id = parse_vint(&mut buf)?;
 
         Ok(TokenIdentifier {
             owner,
@@ -62,8 +67,9 @@ impl TryFrom<Vec<u8>> for TokenIdentifier {
     }
 }
 
-#[derive(Debug)]
-#[allow(dead_code)]
+/// A Hadoop security token: an opaque identifier and password issued by a service, plus the
+/// token kind and the service it authenticates to.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Token {
     pub(crate) alias: String,
     pub(crate) identifier: Vec<u8>,
@@ -73,16 +79,78 @@ pub struct Token {
 }
 
 impl Token {
-    fn load_tokens() -> Vec<Self> {
+    /// Creates a token from its parts.
+    pub fn new(
+        identifier: Vec<u8>,
+        password: Vec<u8>,
+        kind: impl Into<String>,
+        service: impl Into<String>,
+    ) -> Self {
+        Self {
+            alias: String::new(),
+            identifier,
+            password,
+            kind: kind.into(),
+            service: service.into(),
+        }
+    }
+
+    /// The alias the token was stored under in a credentials file, if any.
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// The serialized token identifier.
+    pub fn identifier(&self) -> &[u8] {
+        &self.identifier
+    }
+
+    /// The token password.
+    pub fn password(&self) -> &[u8] {
+        &self.password
+    }
+
+    /// The token kind, such as `HDFS_DELEGATION_TOKEN` or `YARN_AM_RM_TOKEN`.
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// The service the token authenticates to, usually `host:port`.
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+
+    /// Replaces the service the token authenticates to.
+    pub fn set_service(&mut self, service: impl Into<String>) {
+        self.service = service.into();
+    }
+
+    /// Converts the token to its protobuf representation.
+    pub fn to_proto(&self) -> TokenProto {
+        TokenProto {
+            identifier: self.identifier.clone(),
+            password: self.password.clone(),
+            kind: self.kind.clone(),
+            service: self.service.clone(),
+        }
+    }
+
+    /// Loads the tokens in the file named by `HADOOP_TOKEN_FILE_LOCATION`.
+    ///
+    /// Returns an empty list when the variable is unset or the file does not exist or cannot be
+    /// parsed.
+    pub fn from_token_file_env() -> Vec<Self> {
         match env::var(HADOOP_TOKEN_FILE_LOCATION).map(PathBuf::from) {
             Ok(path) if path.exists() => Self::read_token_file(&path).ok().unwrap_or_default(),
             _ => Vec::new(),
         }
     }
 
-    fn read_token_file(path: &Path) -> std::io::Result<Vec<Self>> {
+    /// Reads a Hadoop credentials file in either the Writable or the protobuf format.
+    pub fn read_token_file(path: &Path) -> std::io::Result<Vec<Self>> {
         let mut content = Bytes::from(fs::read(path)?);
 
+        ensure_remaining(&content, 5)?;
         let magic = content.copy_to_bytes(4);
 
         if magic != TOKEN_STORAGE_MAGIC {
@@ -108,19 +176,16 @@ impl Token {
     }
 
     fn parse_writable(reader: &mut impl Buf) -> io::Result<Vec<Token>> {
-        let token_count = parse_vlong(reader);
-        let mut tokens = Vec::<Token>::with_capacity(token_count as usize);
+        let token_count = parse_length(reader)?;
+        let mut tokens = Vec::<Token>::with_capacity(token_count.min(1024));
 
         for _ in 0..token_count {
-            let alias_length = parse_vlong(reader);
-            let alias = String::from_utf8(reader.copy_to_bytes(alias_length as usize).to_vec())
+            let alias = String::from_utf8(parse_bytes(reader)?)
                 .map_err(|_| io::Error::other("Failed to parse token".to_string()))?;
 
-            let identifier_length = parse_vlong(reader);
-            let identifier = reader.copy_to_bytes(identifier_length as usize).to_vec();
+            let identifier = parse_bytes(reader)?;
 
-            let password_length = parse_vlong(reader);
-            let password = reader.copy_to_bytes(password_length as usize).to_vec();
+            let password = parse_bytes(reader)?;
 
             let kind = parse_vint_string(reader)?;
             let service = parse_vint_string(reader)?;
@@ -170,8 +235,49 @@ impl From<TokenProto> for Token {
     }
 }
 
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Token")
+            .field("alias", &self.alias)
+            .field("kind", &self.kind)
+            .field("service", &self.service)
+            .field("identifier_len", &self.identifier.len())
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+fn ensure_remaining(reader: &impl Buf, length: usize) -> io::Result<()> {
+    if reader.remaining() < length {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated Hadoop Writable data",
+        ));
+    }
+    Ok(())
+}
+
+/// Parse a non-negative vlong length.
+fn parse_length(reader: &mut impl Buf) -> io::Result<usize> {
+    let length = parse_vlong(reader)?;
+    usize::try_from(length).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid length {length} in Hadoop Writable data"),
+        )
+    })
+}
+
+/// Parse a byte array prefixed with its length as a vlong.
+fn parse_bytes(reader: &mut impl Buf) -> io::Result<Vec<u8>> {
+    let length = parse_length(reader)?;
+    ensure_remaining(reader, length)?;
+    Ok(reader.copy_to_bytes(length).to_vec())
+}
+
 /// Adapted from WritableUtils class in Hadoop
-fn parse_vlong(reader: &mut impl Buf) -> i64 {
+fn parse_vlong(reader: &mut impl Buf) -> io::Result<i64> {
+    ensure_remaining(reader, 1)?;
     let first_byte = reader.get_i8();
 
     let length = if first_byte >= -112 {
@@ -183,9 +289,10 @@ fn parse_vlong(reader: &mut impl Buf) -> i64 {
     };
 
     if length == 1 {
-        return first_byte as i64;
+        return Ok(first_byte as i64);
     }
 
+    ensure_remaining(reader, (length - 1) as usize)?;
     let mut i = 0i64;
     for _ in 0..length - 1 {
         let b = reader.get_u8();
@@ -195,24 +302,36 @@ fn parse_vlong(reader: &mut impl Buf) -> i64 {
 
     let is_negative = first_byte < -120 || (-112..0).contains(&first_byte);
 
-    if is_negative { i ^ -1 } else { i }
+    Ok(if is_negative { i ^ -1 } else { i })
 }
 
-fn parse_vint(reader: &mut impl Buf) -> i32 {
+fn parse_vint(reader: &mut impl Buf) -> io::Result<i32> {
     // Same method as a long, but it should just be in the int range
-    let n = parse_vlong(reader);
-    assert!(n > i32::MIN as i64 && n < i32::MAX as i64);
-    n as i32
+    let n = parse_vlong(reader)?;
+    i32::try_from(n).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("vint {n} out of range in Hadoop Writable data"),
+        )
+    })
 }
 
 fn parse_string(reader: &mut impl Buf, length: i32) -> io::Result<String> {
-    String::from_utf8(reader.copy_to_bytes(length as usize).to_vec())
+    let length = usize::try_from(length).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid string length {length} in Hadoop Writable data"),
+        )
+    })?;
+    ensure_remaining(reader, length)?;
+    String::from_utf8(reader.copy_to_bytes(length).to_vec())
         .map_err(|_| io::Error::other("Failed to parse string from writable".to_string()))
 }
 
 /// Parse a string prefixed with the length as an int
 #[allow(dead_code)]
 fn parse_int_string(reader: &mut impl Buf) -> io::Result<Option<String>> {
+    ensure_remaining(reader, 4)?;
     let length = reader.get_i32();
     let value = if length == -1 {
         None
@@ -224,7 +343,7 @@ fn parse_int_string(reader: &mut impl Buf) -> io::Result<Option<String>> {
 
 /// Parse a string prefixed with the length as a vint
 fn parse_vint_string(reader: &mut impl Buf) -> io::Result<String> {
-    let length = parse_vint(reader);
+    let length = parse_vint(reader)?;
     parse_string(reader, length)
 }
 
@@ -242,7 +361,7 @@ pub struct User {
 
 impl User {
     pub(crate) fn get() -> Self {
-        let tokens = Token::load_tokens();
+        let tokens = Token::from_token_file_env();
         User { tokens }
     }
 
@@ -251,10 +370,19 @@ impl User {
             .iter()
             .filter(|t| t.kind == kind && t.service == service)
             .find(|t| {
-                // Ignore any tokens that are set to expire in the next 60 seconds
-                let token_identifier: TokenIdentifier = t.identifier.clone().try_into().unwrap();
-                debug!("Token Identifier: {:?}", token_identifier);
-                token_identifier.max_date > Utc::now().timestamp_millis() + 60000
+                // Ignore any delegation tokens that are set to expire in the next 60 seconds.
+                // Other token kinds don't use the delegation identifier format, so there is no
+                // expiry to check.
+                match TokenIdentifier::try_from(t.identifier.clone()) {
+                    Ok(token_identifier) => {
+                        debug!("Token Identifier: {:?}", token_identifier);
+                        token_identifier.max_date > Utc::now().timestamp_millis() + 60000
+                    }
+                    Err(error) => {
+                        debug!("Not checking expiry of {} token: {error}", t.kind);
+                        true
+                    }
+                }
             })
     }
 
@@ -364,5 +492,59 @@ mod tests {
 
         let token_identifier: TokenIdentifier = tokens[0].identifier.clone().try_into().unwrap();
         assert_eq!(token_identifier.max_date, 1686955057021)
+    }
+
+    #[test]
+    fn test_truncated_token_files_return_errors() {
+        let mut token_file = NamedTempFile::new().unwrap();
+        // Writable format claiming one token, then ending.
+        token_file.write_all(b"HDTS\x00\x01").unwrap();
+        token_file.flush().unwrap();
+        assert!(Token::read_token_file(token_file.path()).is_err());
+
+        let mut token_file = NamedTempFile::new().unwrap();
+        token_file.write_all(b"HD").unwrap();
+        token_file.flush().unwrap();
+        assert!(Token::read_token_file(token_file.path()).is_err());
+    }
+
+    #[test]
+    fn test_non_delegation_identifiers_are_rejected_without_panicking() {
+        // A protobuf-encoded identifier, as YARN uses for AMRM and NM tokens.
+        let identifier = vec![0x0a, 0x04, 0x08, 0x01, 0x10, 0x02];
+        assert!(TokenIdentifier::try_from(identifier).is_err());
+        assert!(TokenIdentifier::try_from(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn test_get_token_accepts_tokens_without_delegation_identifiers() {
+        let user = User {
+            tokens: vec![Token::new(
+                vec![0x0a, 0x04, 0x08, 0x01, 0x10, 0x02],
+                b"password".to_vec(),
+                "YARN_AM_RM_TOKEN",
+                "127.0.0.1:8030",
+            )],
+        };
+
+        let token = user
+            .get_token("YARN_AM_RM_TOKEN", "127.0.0.1:8030")
+            .unwrap();
+        assert_eq!(token.kind(), "YARN_AM_RM_TOKEN");
+        assert!(user.get_token("YARN_AM_RM_TOKEN", "other:8030").is_none());
+    }
+
+    #[test]
+    fn test_token_debug_redacts_password() {
+        let token = Token::new(b"id".to_vec(), b"secret-password".to_vec(), "KIND", "svc");
+        let debug = format!("{token:?}");
+        assert!(!debug.contains("secret"), "{debug}");
+        assert!(debug.contains("KIND"));
+    }
+
+    #[test]
+    fn test_token_proto_round_trip() {
+        let token = Token::new(b"id".to_vec(), b"pw".to_vec(), "KIND", "svc");
+        assert_eq!(Token::from(token.to_proto()), token);
     }
 }

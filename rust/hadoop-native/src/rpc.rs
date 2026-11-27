@@ -19,8 +19,8 @@ use uuid::Uuid;
 use crate::config::Configuration;
 use crate::proto::common;
 use crate::proto::common::rpc_response_header_proto::RpcStatusProto;
-use crate::security::sasl::{SaslReader, SaslWriter, negotiate_sasl_session};
-use crate::security::user::UserInfo;
+use crate::security::sasl::{SaslReader, SaslWriter, negotiate_sasl_session, use_sasl};
+use crate::security::user::{Token, UserInfo};
 use crate::{HadoopError, Result};
 
 // Connect to a remote host and return a TcpStream with standard options we want
@@ -96,6 +96,10 @@ pub struct RpcConnectionOptions<'a> {
     pub token_service: &'a str,
     pub effective_user: Option<String>,
     pub auth: Option<Arc<crate::security::ClientAuth>>,
+    /// A token to authenticate with, taking precedence over tokens of `token_kind` in
+    /// `HADOOP_TOKEN_FILE_LOCATION`. Supplying one makes the connection negotiate SASL even when
+    /// Hadoop security is disabled, matching Hadoop's Java client.
+    pub token: Option<Token>,
 }
 
 #[derive(Debug)]
@@ -185,7 +189,7 @@ impl<C: RpcAlignmentContext> RpcConnection<C> {
         // Service class
         stream.write_all(&[0u8]).await?;
         // Auth protocol
-        if config.security_enabled() {
+        if use_sasl(config, options.token.as_ref()) {
             stream.write_all(&(-33i8).to_be_bytes()).await?;
         } else {
             stream.write_all(&(0i8).to_be_bytes()).await?;
@@ -198,6 +202,7 @@ impl<C: RpcAlignmentContext> RpcConnection<C> {
             config,
             options.effective_user,
             options.auth,
+            options.token,
         );
 
         let rpc_timeout = config.ipc_client_rpc_timeout();
@@ -658,6 +663,7 @@ mod tests {
             token_service: "example",
             effective_user: None,
             auth: None,
+            token: None,
         };
 
         let error = runtime
@@ -682,5 +688,53 @@ mod tests {
                 .contains("Timed out negotiating the connection to 127.0.0.1:"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn supplied_token_negotiates_sasl_without_security() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let config = Configuration::new(
+            None,
+            Some(HashMap::from([(
+                "ipc.client.rpc-timeout.ms".to_owned(),
+                "200".to_owned(),
+            )])),
+        )
+        .unwrap();
+
+        let header = runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = listener.local_addr().unwrap().to_string();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut header = [0u8; 7];
+                socket.read_exact(&mut header).await.unwrap();
+                header
+            });
+
+            let options = RpcConnectionOptions {
+                protocol: "org.apache.hadoop.example.Protocol",
+                token_kind: "EXAMPLE_TOKEN",
+                token_service: "example",
+                effective_user: None,
+                auth: None,
+                token: Some(crate::security::user::Token::new(
+                    b"id".to_vec(),
+                    b"pw".to_vec(),
+                    "EXAMPLE_TOKEN",
+                    "example",
+                )),
+            };
+            // The server never answers the SASL negotiation, so this times out.
+            let _ =
+                RpcConnection::<()>::connect(&url, options, None, &config, runtime.handle()).await;
+            server.await.unwrap()
+        });
+
+        assert_eq!(&header[..4], b"hrpc");
+        assert_eq!(header[6] as i8, -33, "expected the SASL auth protocol");
     }
 }

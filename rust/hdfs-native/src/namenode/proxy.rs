@@ -137,6 +137,7 @@ impl ProxyConnection {
                                         .unwrap_or(&self.url),
                                     effective_user: self.effective_user.clone(),
                                     auth: self.auth.clone(),
+                                    token: None,
                                 },
                                 self.alignment_context.clone(),
                                 &self.config,

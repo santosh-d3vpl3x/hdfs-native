@@ -200,6 +200,11 @@ impl Credentials {
         self.tokens.iter().find(|token| token.alias == alias)
     }
 
+    /// Whether there are no tokens and no secret keys.
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty() && self.secret_keys.is_empty()
+    }
+
     /// All tokens, in the order they were added or read.
     pub fn tokens(&self) -> &[Token] {
         &self.tokens

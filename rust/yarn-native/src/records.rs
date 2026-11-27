@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
-use hadoop_native::security::user::Token;
+use hadoop_native::security::user::{Credentials, SerializedFormat, Token};
 use url::Url;
 
 use crate::ids::{ApplicationAttemptId, ApplicationId, ContainerId, NodeId};
@@ -540,8 +540,9 @@ pub struct ContainerLaunchContext {
     pub local_resources: HashMap<String, LocalResource>,
     /// Data for NodeManager auxiliary services, keyed by service name.
     pub service_data: HashMap<String, Vec<u8>>,
-    /// Hadoop credentials for the container, in the binary format of a token storage file.
-    pub tokens: Option<Vec<u8>>,
+    /// Tokens and secret keys for the container. The NodeManager writes them to a token file
+    /// and points `HADOOP_TOKEN_FILE_LOCATION` at it.
+    pub credentials: Credentials,
 }
 
 impl ContainerLaunchContext {
@@ -560,6 +561,12 @@ impl ContainerLaunchContext {
     /// Add a local resource, linked as `name` in the working directory
     pub fn local_resource(mut self, name: impl Into<String>, resource: LocalResource) -> Self {
         self.local_resources.insert(name.into(), resource);
+        self
+    }
+
+    /// Set the tokens and secret keys for the container
+    pub fn credentials(mut self, credentials: Credentials) -> Self {
+        self.credentials = credentials;
         self
     }
 }
@@ -592,7 +599,9 @@ impl From<ContainerLaunchContext> for ContainerLaunchContextProto {
                     value: Some(value),
                 })
                 .collect(),
-            tokens: value.tokens,
+            // The format Java's ContainerLaunchContext users write and NodeManagers read
+            tokens: (!value.credentials.is_empty())
+                .then(|| value.credentials.to_bytes(SerializedFormat::Writable)),
             ..Default::default()
         }
     }
@@ -811,7 +820,8 @@ mod tests {
             .env("KEY", "value")
             .local_resource("app.jar", resource);
 
-        let proto = ContainerLaunchContextProto::from(context);
+        let proto = ContainerLaunchContextProto::from(context.clone());
+        assert_eq!(proto.tokens, None);
         assert_eq!(proto.command, vec!["java", "-jar", "app.jar"]);
         assert_eq!(proto.environment.len(), 1);
         assert_eq!(proto.environment[0].value.as_deref(), Some("value"));
@@ -822,6 +832,21 @@ mod tests {
             local.visibility(),
             LocalResourceVisibilityProto::Application
         );
+
+        let mut credentials = Credentials::new();
+        credentials.add_token(
+            "nn:8020",
+            Token::new(
+                b"id".to_vec(),
+                b"pw".to_vec(),
+                "HDFS_DELEGATION_TOKEN",
+                "nn:8020",
+            ),
+        );
+        let proto = ContainerLaunchContextProto::from(context.credentials(credentials.clone()));
+        let tokens = proto.tokens.expect("credentials are sent");
+        assert_eq!(&tokens[..5], b"HDTS\x00");
+        assert_eq!(Credentials::from_bytes(&tokens).unwrap(), credentials);
     }
 
     #[test]

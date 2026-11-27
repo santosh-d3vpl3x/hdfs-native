@@ -6,8 +6,8 @@ mod test {
 
     use serial_test::serial;
     use yarn_native::{
-        AmRmClientBuilder, NmClient, NmClientBuilder, Result, YarnClient, YarnClientBuilder,
-        YarnError,
+        AmRmClientBuilder, Credentials, NmClient, NmClientBuilder, Result, Token, YarnClient,
+        YarnClientBuilder, YarnError,
         am::{AllocateRequest, AmRmClient},
         client::ApplicationFilter,
         ids::{ApplicationId, ContainerId, NodeId},
@@ -224,16 +224,39 @@ mod test {
             .build_async()
             .await?;
 
-        // A container that writes its environment to a file and exits
+        // A container that writes its environment and its token file out, then exits
         let output = std::env::current_dir()
             .unwrap()
             .join(PathBuf::from(format!("target/test/{}", containers[0].id)));
+        let tokens_output = output.with_extension("tokens");
         let _ = std::fs::remove_file(&output);
+        let _ = std::fs::remove_file(&tokens_output);
+        let mut credentials = Credentials::new();
+        credentials.add_token(
+            "nn:8020",
+            Token::new(
+                b"identifier".to_vec(),
+                b"password".to_vec(),
+                "HDFS_DELEGATION_TOKEN",
+                "nn:8020",
+            ),
+        );
+        credentials.add_secret_key("secret", b"key".to_vec());
         nm.start_container(
             &containers[0],
             ContainerLaunchContext::default()
-                .commands(["echo", "$GREETING", ">", output.to_str().unwrap()])
-                .env("GREETING", "hello-yarn"),
+                .commands([
+                    "echo",
+                    "$GREETING",
+                    ">",
+                    output.to_str().unwrap(),
+                    "&&",
+                    "cp",
+                    "\"$HADOOP_TOKEN_FILE_LOCATION\"",
+                    tokens_output.to_str().unwrap(),
+                ])
+                .env("GREETING", "hello-yarn")
+                .credentials(credentials.clone()),
         )
         .await?;
         let status = wait_for_container_state(
@@ -245,6 +268,16 @@ mod test {
         .await;
         assert_eq!(status.exit_status, 0, "{}", status.diagnostics);
         assert_eq!(std::fs::read_to_string(&output)?.trim(), "hello-yarn");
+        // The NodeManager (Java) parsed our credentials and wrote them back for the container
+        let container_credentials = Credentials::read_token_file(&tokens_output)?;
+        assert_eq!(
+            container_credentials.token("nn:8020"),
+            credentials.token("nn:8020")
+        );
+        assert_eq!(
+            container_credentials.secret_key("secret"),
+            Some(&b"key"[..])
+        );
 
         // Starting the same container again fails for that container only
         let restart = nm

@@ -57,5 +57,5 @@ pub use am::{AmRmClient, AmRmClientBuilder, NmTokenCache};
 pub use client::{YarnClient, YarnClientBuilder};
 pub use error::Result;
 pub use error::YarnError;
-pub use hadoop_native::security::user::Token;
+pub use hadoop_native::security::user::{Credentials, SerializedFormat, Token};
 pub use nm::{NmClient, NmClientBuilder};

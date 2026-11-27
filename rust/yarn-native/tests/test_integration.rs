@@ -9,8 +9,8 @@ mod test {
 
     use serial_test::serial;
     use yarn_native::{
-        AmRmClientBuilder, Credentials, NmClient, NmClientBuilder, Result, Token, YarnClient,
-        YarnClientBuilder, YarnError,
+        AmRmClientBuilder, Credentials, NmClient, NmClientBuilder, Result, SerializedFormat, Token,
+        YarnClient, YarnClientBuilder, YarnError,
         am::{AllocateRequest, AmRmClient},
         client::ApplicationFilter,
         ids::{ApplicationId, ContainerId, NodeId},
@@ -30,6 +30,63 @@ mod test {
     const TEST_AM: &str = env!("CARGO_BIN_EXE_yarn-native-test-am");
     /// The Kerberized HDFS that MiniYarn starts with YarnFeatures::Security
     const SECURE_HDFS: &str = "hdfs://127.0.0.1:19000";
+
+    /// Sets an environment variable until dropped, then restores it.
+    struct EnvVarGuard {
+        name: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let original = std::env::var_os(name);
+            unsafe { std::env::set_var(name, value) };
+            Self { name, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => unsafe { std::env::set_var(self.name, value) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
+
+    /// A client without a Kerberos ticket authenticates with a ResourceManager delegation token
+    /// from a token file, until the token is cancelled.
+    async fn test_rm_delegation_token_authenticates(client: &YarnClient) -> Result<()> {
+        let token = client.get_delegation_token("yarn").await?;
+        let token_file = test_dir().join("rm_delegation_token");
+        Credentials::from(vec![token.clone()])
+            .write_token_file(&token_file, SerializedFormat::Writable)?;
+
+        let _cache = EnvVarGuard::set("KRB5CCNAME", "FILE:target/test/nonexistent-cache");
+        let _tokens = EnvVarGuard::set("HADOOP_TOKEN_FILE_LOCATION", &token_file);
+        YarnClientBuilder::new()
+            .build_async()
+            .await?
+            .get_cluster_metrics()
+            .await?;
+        // Like Hadoop's Java client, having a token for the ResourceManager is enough to
+        // negotiate SASL, even without security configured
+        YarnClientBuilder::new()
+            .with_config([("hadoop.security.authentication", "simple")])
+            .build_async()
+            .await?
+            .get_cluster_metrics()
+            .await?;
+
+        client.cancel_delegation_token(&token).await?;
+        let cancelled = YarnClientBuilder::new()
+            .build_async()
+            .await?
+            .get_cluster_metrics()
+            .await;
+        assert!(cancelled.is_err(), "{cancelled:?}");
+        Ok(())
+    }
 
     fn test_dir() -> PathBuf {
         std::env::current_dir().unwrap().join("target/test")
@@ -266,7 +323,7 @@ mod test {
             .status()
             .unwrap();
         assert!(status.success(), "Failed to create the archive");
-        let mut archive = upload_resource(
+        let archive = upload_resource(
             &hdfs,
             &archive,
             "/yarn-native-staging/am.tgz",
@@ -274,9 +331,6 @@ mod test {
             LocalResourceVisibility::Application,
         )
         .await;
-        // Refer to it on the default filesystem, without a host or port, as an HA nameservice
-        // path also has no port. Java must not see port 0.
-        archive.url = "hdfs:///yarn-native-staging/am.tgz".parse().unwrap();
 
         let (dir, worker_command) = read_hdfs_command("secure-workers", path);
         run_application_master(
@@ -529,6 +583,9 @@ mod test {
 
         // The client authenticates as yarn/localhost, which the ResourceManager knows as yarn
         test_cluster_info(&client, "yarn").await.unwrap();
+        test_rm_delegation_token_authenticates(&client)
+            .await
+            .unwrap();
         test_kill_application(&client).await.unwrap();
 
         // The ResourceManager only returns an unmanaged AMRMToken to a caller whose user name is

@@ -51,6 +51,7 @@ pub trait SaslSession: Send + Sync {
     fn get_user_info(&self) -> Result<UserInfo>;
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn negotiate_sasl_session(
     stream: TcpStream,
     token_kind: &str,
@@ -59,16 +60,16 @@ pub(crate) async fn negotiate_sasl_session(
     effective_user: Option<String>,
     auth: Option<std::sync::Arc<crate::security::ClientAuth>>,
     token: Option<Token>,
+    sasl: bool,
 ) -> Result<(UserInfo, SaslReader, SaslWriter)> {
     let (reader, writer) = stream.into_split();
     let mut reader = SaslReader::new(reader);
     let mut writer = SaslWriter::new(writer);
 
     let security_enabled = config.security_enabled();
-    // Like Hadoop's Java client, negotiate SASL when security is enabled or when the caller
-    // supplies a token. Some services, such as YARN's ApplicationMaster and NodeManager
-    // endpoints, always require token authentication even on insecure clusters.
-    if !use_sasl(config, token.as_ref()) {
+    let explicit_token = token.is_some();
+    // The caller decided with `use_sasl` and told the server in the connection header
+    if !sasl {
         return Ok((User::get_simple_user(effective_user), reader, writer));
     }
 
@@ -162,14 +163,18 @@ pub(crate) async fn negotiate_sasl_session(
         }
     }
 
-    // No session means the server asked for simple authentication. That is only a downgrade when
-    // the client itself is configured for secure authentication.
-    if session.is_none() && security_enabled && !config.ipc_client_fallback_to_simple_auth_allowed()
+    // No session means the server asked for simple authentication. That is a downgrade when the
+    // client is configured for secure authentication, like in Hadoop's Java client, or when the
+    // caller supplied a token: the services that take one, such as YARN's ApplicationMaster and
+    // NodeManager endpoints, never accept simple authentication, so only an impostor would ask.
+    if session.is_none()
+        && (security_enabled || explicit_token)
+        && !config.ipc_client_fallback_to_simple_auth_allowed()
     {
         return Err(HdfsError::SASLError(
             "The server only accepts SIMPLE authentication from this client, but the client is \
-             configured for secure authentication. Set ipc.client.fallback-to-simple-auth-allowed \
-             to allow it"
+             configured for secure authentication or was given a token. Set \
+             ipc.client.fallback-to-simple-auth-allowed to allow it"
                 .to_string(),
         ));
     }
@@ -193,9 +198,18 @@ pub(crate) async fn negotiate_sasl_session(
     Ok((user_info, reader, writer))
 }
 
-/// Whether a connection should negotiate SASL rather than use simple authentication.
-pub(crate) fn use_sasl(config: &Configuration, token: Option<&Token>) -> bool {
-    config.security_enabled() || token.is_some()
+/// Whether a connection should negotiate SASL rather than use simple authentication. Like
+/// Hadoop's Java client, it does when security is enabled or when it has a token to use: one the
+/// caller supplied, or one for this connection's service in `HADOOP_TOKEN_FILE_LOCATION`.
+pub(crate) fn use_sasl(
+    config: &Configuration,
+    token: Option<&Token>,
+    token_kind: &str,
+    service: &str,
+) -> bool {
+    config.security_enabled()
+        || token.is_some()
+        || User::get().get_token(token_kind, service).is_some()
 }
 
 async fn step_session(
@@ -470,9 +484,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!use_sasl(&simple, None));
-        assert!(use_sasl(&simple, Some(&token())));
-        assert!(use_sasl(&kerberos, None));
+        assert!(!use_sasl(&simple, None, "YARN_AM_RM_TOKEN", "rm:8030"));
+        assert!(use_sasl(
+            &simple,
+            Some(&token()),
+            "YARN_AM_RM_TOKEN",
+            "rm:8030"
+        ));
+        assert!(use_sasl(&kerberos, None, "YARN_AM_RM_TOKEN", "rm:8030"));
     }
 
     #[test]

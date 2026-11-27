@@ -161,13 +161,15 @@ pub(crate) struct ServiceProxy {
     proxy_connections: Vec<ProxyConnection>,
     current_active: AtomicUsize,
     token: Arc<Mutex<Option<Token>>>,
+    token_service: String,
     failover: FailoverSettings,
 }
 
 impl ServiceProxy {
     /// Creates a proxy to the servers at `addresses`, in failover order. `token` is used to
-    /// authenticate new connections when set; otherwise a token of the protocol's kind for
-    /// `token_service` is taken from `HADOOP_TOKEN_FILE_LOCATION` when security is enabled.
+    /// authenticate new connections when set; otherwise each connection looks for a token of
+    /// the protocol's kind for its server's service in `HADOOP_TOKEN_FILE_LOCATION`, such as
+    /// one for `token_service`, the comma-separated services of all the servers.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         protocol: Protocol,
@@ -195,9 +197,10 @@ impl ServiceProxy {
         let proxy_connections = addresses
             .into_iter()
             .map(|address| ProxyConnection {
+                // Like Hadoop's token selectors, look tokens up by this server's own service
+                token_service: config.token_service(&address),
                 address,
                 protocol,
-                token_service: token_service.clone(),
                 inner: Arc::new(tokio::sync::Mutex::new(None)),
                 token: Arc::clone(&token),
                 effective_user: effective_user.clone(),
@@ -211,6 +214,7 @@ impl ServiceProxy {
             proxy_connections,
             current_active: AtomicUsize::new(0),
             token,
+            token_service,
             failover,
         })
     }
@@ -226,9 +230,9 @@ impl ServiceProxy {
         self.token.lock().unwrap().clone()
     }
 
-    /// The token service name new connections look tokens up by.
+    /// The service name for tokens to these servers, which covers all of them.
     pub(crate) fn token_service(&self) -> &str {
-        &self.proxy_connections[0].token_service
+        &self.token_service
     }
 
     fn is_retriable(exception: &str) -> bool {

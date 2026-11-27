@@ -616,10 +616,20 @@ impl User {
         User { tokens }
     }
 
+    /// Whether a token for `token_service` authenticates to `service`. A token for an HA
+    /// service, such as ResourceManager HA, names each server's service separated by commas;
+    /// Hadoop's token selectors accept it for any of them.
+    fn service_matches(token_service: &str, service: &str) -> bool {
+        token_service == service
+            || token_service
+                .split(',')
+                .any(|token_service| token_service.trim() == service)
+    }
+
     pub(crate) fn get_token(&self, kind: &str, service: &str) -> Option<&Token> {
         self.tokens
             .iter()
-            .filter(|t| t.kind == kind && t.service == service)
+            .filter(|t| t.kind == kind && Self::service_matches(&t.service, service))
             .find(|t| {
                 // Ignore any delegation tokens that are set to expire in the next 60 seconds.
                 // Other token kinds don't use the delegation identifier format, so there is no
@@ -907,5 +917,33 @@ mod tests {
             assert_eq!(parse_vlong(&mut reader).unwrap(), value);
             assert!(!reader.has_remaining(), "{value}");
         }
+    }
+
+    #[test]
+    fn test_ha_token_services_match_each_server() {
+        let user = User {
+            tokens: vec![Token::new(
+                b"id".to_vec(),
+                b"pw".to_vec(),
+                "RM_DELEGATION_TOKEN",
+                "10.0.0.1:8032,10.0.0.2:8032",
+            )],
+        };
+        assert!(
+            user.get_token("RM_DELEGATION_TOKEN", "10.0.0.1:8032")
+                .is_some()
+        );
+        assert!(
+            user.get_token("RM_DELEGATION_TOKEN", "10.0.0.2:8032")
+                .is_some()
+        );
+        assert!(
+            user.get_token("RM_DELEGATION_TOKEN", "10.0.0.3:8032")
+                .is_none()
+        );
+        assert!(
+            user.get_token("RM_DELEGATION_TOKEN", "10.0.0.1:803")
+                .is_none()
+        );
     }
 }

@@ -3265,6 +3265,7 @@ dependencies = [
  "tokio",
  "url",
  "which 8.0.6",
+ "whoami",
 ]
 
 [[package]]

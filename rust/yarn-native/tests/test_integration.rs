@@ -66,6 +66,8 @@ mod test {
         assert_eq!(queue.queue_name, "default");
         assert_eq!(queue.state, QueueState::Running);
 
+        test_delegation_tokens(client).await?;
+
         let missing = client
             .get_application_report(ApplicationId::new(1, 9999))
             .await;
@@ -73,6 +75,31 @@ mod test {
             matches!(missing, Err(YarnError::ApplicationNotFound(_))),
             "{missing:?}"
         );
+        Ok(())
+    }
+
+    async fn test_delegation_tokens(client: &YarnClient) -> Result<()> {
+        // Without Kerberos the ResourceManager still issues tokens. Only the renewer may renew.
+        let renewer = whoami::username().unwrap();
+        let token = client.get_delegation_token(&renewer).await?;
+        assert_eq!(token.kind(), "RM_DELEGATION_TOKEN");
+        let address = std::fs::read_to_string("target/test/yarn-site.xml")?;
+        let port = token.service().rsplit_once(':').unwrap().1;
+        assert!(
+            address.contains(&format!("localhost:{port}")),
+            "{}",
+            token.service()
+        );
+
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(client.renew_delegation_token(&token).await? > now_millis);
+
+        client.cancel_delegation_token(&token).await?;
+        let renewed = client.renew_delegation_token(&token).await;
+        assert!(renewed.is_err(), "{renewed:?}");
         Ok(())
     }
 

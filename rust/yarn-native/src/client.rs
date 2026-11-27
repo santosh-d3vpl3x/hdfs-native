@@ -605,6 +605,25 @@ impl YarnClient {
         token.set_service(self.protocol.token_service());
         Ok(token)
     }
+
+    /// Extend the lifetime of a ResourceManager delegation token, returning its new expiry
+    /// time in milliseconds since the epoch. Only the token's renewer may renew it, and never
+    /// beyond its maximum lifetime.
+    pub async fn renew_delegation_token(&self, token: &Token) -> Result<u64> {
+        Ok(self
+            .protocol
+            .renew_delegation_token(token.to_proto())
+            .await?
+            .new_expiry_time)
+    }
+
+    /// Cancel a ResourceManager delegation token so it can no longer be used.
+    pub async fn cancel_delegation_token(&self, token: &Token) -> Result<()> {
+        self.protocol
+            .cancel_delegation_token(token.to_proto())
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

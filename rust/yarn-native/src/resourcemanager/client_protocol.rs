@@ -216,4 +216,22 @@ impl ApplicationClientProtocol {
         let message = common::GetDelegationTokenRequestProto { renewer };
         self.proxy.call("getDelegationToken", message, true).await
     }
+
+    pub(crate) async fn renew_delegation_token(
+        &self,
+        token: common::TokenProto,
+    ) -> Result<common::RenewDelegationTokenResponseProto> {
+        let message = common::RenewDelegationTokenRequestProto { token };
+        self.proxy.call("renewDelegationToken", message, true).await
+    }
+
+    pub(crate) async fn cancel_delegation_token(
+        &self,
+        token: common::TokenProto,
+    ) -> Result<common::CancelDelegationTokenResponseProto> {
+        let message = common::CancelDelegationTokenRequestProto { token };
+        self.proxy
+            .call("cancelDelegationToken", message, true)
+            .await
+    }
 }

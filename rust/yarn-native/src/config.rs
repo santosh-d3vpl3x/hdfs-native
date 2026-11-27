@@ -154,15 +154,22 @@ impl Configuration {
     /// `hadoop.security.token.service.use_ip` is false.
     pub(crate) fn token_service(&self, address: &str) -> String {
         if self.get_boolean(TOKEN_SERVICE_USE_IP, true)
-            && let Some(resolved) = address
-                .to_socket_addrs()
-                .ok()
-                .and_then(|mut addrs| addrs.next())
+            && let Ok(addrs) = address.to_socket_addrs()
         {
-            resolved.to_string()
-        } else {
-            address.to_string()
+            // Prefer IPv4 when a host resolves to both families, matching Java's default
+            // `InetAddress.getByName` behavior (`java.net.preferIPv6Addresses=false`).
+            let mut first = None;
+            for addr in addrs {
+                if addr.is_ipv4() {
+                    return addr.to_string();
+                }
+                first.get_or_insert(addr);
+            }
+            if let Some(resolved) = first {
+                return resolved.to_string();
+            }
         }
+        address.to_string()
     }
 
     /// The token service for a set of ResourceManager addresses, like Hadoop's

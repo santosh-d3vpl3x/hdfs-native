@@ -164,6 +164,8 @@ The `yarn-native` crate implements the client side of YARN's three RPC protocols
 
 An ApplicationMaster that YARN runs reads its AMRMToken from the container's token file, so `AmRmClientBuilder` needs no other setup. Give it the delegation tokens it needs, such as HDFS tokens, in its launch context's credentials, with `YarnClient::delegation_token_renewer` as their renewer so the ResourceManager renews them while the application runs.
 
+The ResourceManager can only renew tokens up to their maximum lifetime, 7 days by default. A longer-running ApplicationMaster can be given a keytab, as a private local resource in HDFS, and log in with it to fetch fresh tokens. Application binaries and environments can likewise ship as archives in HDFS. The integration tests' ApplicationMaster (`rust/yarn-native/tests/bin/application_master.rs`) shows both on a Kerberized cluster.
+
 Unmanaged ApplicationMasters on a Kerberized cluster are the exception: the ResourceManager only returns their AMRMToken to a caller whose user name equals the application's user, which a Kerberos principal's full name never is. Submit them as an impersonated user (`with_user`), which requires `hadoop.proxyuser.<principal short name>.*` settings on the cluster.
 
 ## Building

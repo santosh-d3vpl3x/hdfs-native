@@ -75,7 +75,8 @@ public class Main {
             conf.set(DFSConfigKeys.DFS_DATANODE_KEYTAB_FILE_KEY, keytab);
             conf.set(DFSConfigKeys.DFS_DATANODE_KERBEROS_PRINCIPAL_KEY, principal);
             conf.set(DFSConfigKeys.DFS_BLOCK_ACCESS_TOKEN_ENABLE_KEY, "true");
-            conf.set(DFSConfigKeys.DFS_DATA_TRANSFER_PROTECTION_KEY, "authentication");
+            // Without data transfer protection, which the NodeManager's localizer doesn't get
+            // from this config, so it can download application files from the DataNode
             conf.set(DFSConfigKeys.IGNORE_SECURE_PORTS_FOR_TESTING_KEY, "true");
             HdfsConfiguration hdfsConf = new HdfsConfiguration(conf);
             dfs = new MiniDFSCluster.Builder(hdfsConf)

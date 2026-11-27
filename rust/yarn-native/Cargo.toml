@@ -11,6 +11,8 @@ license = "Apache-2.0"
 [dependencies]
 bytes = { workspace = true }
 hadoop-native = { version = "0.1.0", path = "../hadoop-native" }
+# Only for the integration tests' ApplicationMaster, which refreshes HDFS delegation tokens
+hdfs-native = { version = "0.16.0", path = "../hdfs-native", optional = true }
 log = { workspace = true }
 prost = "0.14"
 rand = "0.10"
@@ -30,7 +32,6 @@ protobuf-src = { version = "2", optional = true }
 
 [dev-dependencies]
 env_logger = { workspace = true }
-hdfs-native = { path = "../hdfs-native" }
 serial_test = "4"
 tokio = { workspace = true, features = ["macros"] }
 
@@ -44,4 +45,4 @@ doc = false
 
 [features]
 generate-protobuf = ["prost-build", "protobuf-src", "hadoop-native/generate-protobuf"]
-integration-test = ["which", "dep:libc"]
+integration-test = ["which", "dep:libc", "dep:hdfs-native"]

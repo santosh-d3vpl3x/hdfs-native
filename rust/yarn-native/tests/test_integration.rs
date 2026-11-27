@@ -17,8 +17,9 @@ mod test {
         miniyarn::{MiniYarn, YarnFeatures},
         records::{
             ApplicationState, ApplicationSubmissionContext, Container, ContainerLaunchContext,
-            ContainerState, ContainerStatus, FinalApplicationStatus, NodeState, QueueState,
-            Resource, ResourceRequest,
+            ContainerState, ContainerStatus, FinalApplicationStatus, LocalResource,
+            LocalResourceType, LocalResourceVisibility, NodeState, QueueState, Resource,
+            ResourceRequest,
         },
     };
 
@@ -27,35 +28,64 @@ mod test {
     const TEST_TAG: &str = "yarn-native-test";
     /// The ApplicationMaster in tests/bin/application_master.rs
     const TEST_AM: &str = env!("CARGO_BIN_EXE_yarn-native-test-am");
+    /// The Kerberized HDFS that MiniYarn starts with YarnFeatures::Security
+    const SECURE_HDFS: &str = "hdfs://127.0.0.1:19000";
 
     fn test_dir() -> PathBuf {
         std::env::current_dir().unwrap().join("target/test")
     }
 
+    /// How to launch the test ApplicationMaster
+    #[derive(Default)]
+    struct AmOptions {
+        /// Worker containers to start once told to
+        workers: usize,
+        /// The workers' command. `{container_id}` is replaced by each worker's container ID.
+        worker_command: String,
+        credentials: Credentials,
+        /// An archive in HDFS holding the ApplicationMaster binary, to run it from instead of
+        /// from the local build
+        archive: Option<LocalResource>,
+        local_resources: Vec<(String, LocalResource)>,
+        env: Vec<(String, String)>,
+    }
+
     /// Submits an application whose ApplicationMaster YARN runs from [`TEST_AM`], waits until
     /// it registers, and connects to the endpoint it registered, as a client of a service
-    /// running in YARN would. The ApplicationMaster starts `workers` containers running
-    /// `worker_command`, giving them `credentials`.
+    /// running in YARN would.
     async fn start_application_master(
         client: &YarnClient,
         name: &str,
-        workers: usize,
-        worker_command: &str,
-        credentials: Credentials,
+        options: AmOptions,
     ) -> Result<(ApplicationId, TcpStream)> {
         let application_id = client.create_application().await?.application_id;
         let am_log = test_dir().join(format!("{name}-am.log"));
         let mut am_container = ContainerLaunchContext::default()
-            .commands([TEST_AM, "1>", am_log.to_str().unwrap(), "2>&1"])
             .env("HADOOP_CONF_DIR", test_dir().to_str().unwrap())
             .env("RUST_BACKTRACE", "1")
-            .env("YARN_NATIVE_TEST_WORKERS", workers.to_string())
-            .env("YARN_NATIVE_TEST_WORKER_COMMAND", worker_command)
-            .credentials(credentials);
+            .env("YARN_NATIVE_TEST_WORKERS", options.workers.to_string())
+            .env("YARN_NATIVE_TEST_WORKER_COMMAND", options.worker_command)
+            .credentials(options.credentials);
+        let binary = match options.archive {
+            Some(archive) => {
+                // YARN extracts an archive into a directory named after its link
+                am_container = am_container.local_resource("am", archive);
+                "./am/yarn-native-test-am".to_string()
+            }
+            None => TEST_AM.to_string(),
+        };
+        am_container =
+            am_container.commands([binary.as_str(), "1>", am_log.to_str().unwrap(), "2>&1"]);
+        for (link, resource) in options.local_resources {
+            am_container = am_container.local_resource(link, resource);
+        }
         for variable in ["HADOOP_OPTS", "JAVA_HOME"] {
             if let Ok(value) = std::env::var(variable) {
                 am_container = am_container.env(variable, value);
             }
+        }
+        for (variable, value) in options.env {
+            am_container = am_container.env(variable, value);
         }
         let mut context = ApplicationSubmissionContext::new(application_id, name);
         context.am_resource = Resource::new(256, 1);
@@ -79,6 +109,12 @@ mod test {
         BufReader::new(&stream).read_line(&mut greeting)?;
         assert_eq!(greeting.trim(), "yarn-native-test-am");
         Ok((application_id, stream))
+    }
+
+    /// Tells the ApplicationMaster to start its workers.
+    fn start_workers(stream: &mut TcpStream) -> Result<()> {
+        writeln!(stream, "start")?;
+        Ok(())
     }
 
     /// Tells the ApplicationMaster to stop and checks the application succeeded.
@@ -110,6 +146,17 @@ mod test {
         Ok(())
     }
 
+    /// Runs the ApplicationMaster with `options` until its workers finish.
+    async fn run_application_master(
+        client: &YarnClient,
+        name: &str,
+        options: AmOptions,
+    ) -> Result<()> {
+        let (application_id, mut stream) = start_application_master(client, name, options).await?;
+        start_workers(&mut stream)?;
+        stop_application_master(client, name, application_id, stream).await
+    }
+
     /// An empty directory for workers to write to, and a command that writes `output` there,
     /// in a file named after the worker's container.
     fn worker_output(name: &str, output: &str) -> (PathBuf, String) {
@@ -129,29 +176,30 @@ mod test {
 
     async fn test_application_master_in_yarn(client: &YarnClient) -> Result<()> {
         // A single container: the ApplicationMaster is the whole application
-        let (application_id, stream) =
-            start_application_master(client, "single-container", 0, "", Credentials::new()).await?;
-        stop_application_master(client, "single-container", application_id, stream).await?;
+        run_application_master(client, "single-container", AmOptions::default()).await?;
 
         // A cluster: the ApplicationMaster starts workers
-        let (dir, command) = worker_output("cluster-workers", "echo worker");
-        let (application_id, stream) =
-            start_application_master(client, "cluster", 2, &command, Credentials::new()).await?;
-        stop_application_master(client, "cluster", application_id, stream).await?;
+        let (dir, worker_command) = worker_output("cluster-workers", "echo worker");
+        run_application_master(
+            client,
+            "cluster",
+            AmOptions {
+                workers: 2,
+                worker_command,
+                ..Default::default()
+            },
+        )
+        .await?;
         assert_eq!(read_worker_output(&dir), vec!["worker\n"; 2]);
         Ok(())
     }
 
-    /// A Kerberos client submits an application with an HDFS delegation token that the
-    /// ResourceManager can renew. The ApplicationMaster hands the token to a worker, whose
-    /// Hadoop client reads Kerberized HDFS with it.
-    async fn test_application_master_reads_hdfs(client: &YarnClient) -> Result<()> {
-        let renewer = client.delegation_token_renewer()?;
-        assert!(renewer.starts_with("yarn/localhost@"), "{renewer}");
+    /// The Kerberized cluster's HDFS, as a submitter outside YARN would use it.
+    fn secure_hdfs() -> hdfs_native::Client {
+        hdfs_native::ClientBuilder::new().build().unwrap()
+    }
 
-        let hdfs = hdfs_native::ClientBuilder::new().build().unwrap();
-        let path = "/yarn-native-am-input";
-        let content = "read by a worker of an ApplicationMaster";
+    async fn write_hdfs_file(hdfs: &hdfs_native::Client, path: &str, content: Vec<u8>) {
         let mut writer = hdfs
             .create(path, hdfs_native::WriteOptions::default().overwrite(true))
             .await
@@ -161,17 +209,144 @@ mod test {
             .await
             .unwrap();
         writer.close().await.unwrap();
+    }
+
+    /// Uploads a local file to HDFS and describes it as a resource for YARN to localize. The
+    /// size and modification time must match the file, or localization fails.
+    async fn upload_resource(
+        hdfs: &hdfs_native::Client,
+        local: &Path,
+        path: &str,
+        resource_type: LocalResourceType,
+        visibility: LocalResourceVisibility,
+    ) -> LocalResource {
+        write_hdfs_file(hdfs, path, std::fs::read(local).unwrap()).await;
+        let status = hdfs.get_file_info(path).await.unwrap();
+        LocalResource {
+            url: format!("{SECURE_HDFS}{path}").parse().unwrap(),
+            size: status.length as i64,
+            timestamp: status.modification_time as i64,
+            resource_type,
+            visibility,
+            pattern: None,
+        }
+    }
+
+    /// A worker command that copies an HDFS file into the worker output, using Hadoop's own
+    /// client with whatever tokens the worker was given.
+    fn read_hdfs_command(name: &str, path: &str) -> (PathBuf, String) {
+        let hadoop = which::which("hadoop").expect("Failed to find hadoop executable");
+        worker_output(name, &format!("{} fs -cat {path}", hadoop.display()))
+    }
+
+    /// A Kerberos client submits an application with an HDFS delegation token that the
+    /// ResourceManager can renew. YARN runs the ApplicationMaster from an archive in HDFS,
+    /// which it downloads with that token. The ApplicationMaster hands the token to a worker,
+    /// whose Hadoop client reads Kerberized HDFS with it.
+    async fn test_application_master_reads_hdfs(client: &YarnClient) -> Result<()> {
+        let renewer = client.delegation_token_renewer()?;
+        assert!(renewer.starts_with("yarn/localhost@"), "{renewer}");
+
+        let hdfs = secure_hdfs();
+        let path = "/yarn-native-am-input";
+        let content = "read by a worker of an ApplicationMaster";
+        write_hdfs_file(&hdfs, path, content.as_bytes().to_vec()).await;
         // The ResourceManager renews the tokens and refuses applications whose tokens it can't
         let credentials = Credentials::from(hdfs.get_delegation_tokens(&renewer).await.unwrap());
 
-        let hadoop = which::which("hadoop").expect("Failed to find hadoop executable");
-        let (dir, command) = worker_output(
-            "secure-workers",
-            &format!("{} fs -cat {path}", hadoop.display()),
-        );
-        let (application_id, stream) =
-            start_application_master(client, "secure", 1, &command, credentials).await?;
-        stop_application_master(client, "secure", application_id, stream).await?;
+        // Ship the ApplicationMaster as an archive in HDFS, as a deployment would ship Sail
+        let archive = test_dir().join("am.tgz");
+        let am_dir = Path::new(TEST_AM).parent().unwrap();
+        let status = std::process::Command::new("tar")
+            .arg("czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(am_dir)
+            .arg("yarn-native-test-am")
+            .status()
+            .unwrap();
+        assert!(status.success(), "Failed to create the archive");
+        let archive = upload_resource(
+            &hdfs,
+            &archive,
+            "/yarn-native-staging/am.tgz",
+            LocalResourceType::Archive,
+            LocalResourceVisibility::Application,
+        )
+        .await;
+
+        let (dir, worker_command) = read_hdfs_command("secure-workers", path);
+        run_application_master(
+            client,
+            "secure",
+            AmOptions {
+                workers: 1,
+                worker_command,
+                credentials,
+                archive: Some(archive),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(read_worker_output(&dir), vec![content.to_string()]);
+        Ok(())
+    }
+
+    /// A long-running ApplicationMaster can't rely on the tokens it was submitted with, which
+    /// stop working after their maximum lifetime. Given a keytab, shipped as a private file in
+    /// HDFS, it logs in and gives workers fresh tokens. The submitted token is cancelled before
+    /// the worker starts, so the worker can only read HDFS with a fresh one.
+    async fn test_application_master_refreshes_tokens(client: &YarnClient) -> Result<()> {
+        let renewer = client.delegation_token_renewer()?;
+        let hdfs = secure_hdfs();
+        let path = "/yarn-native-refresh-input";
+        let content = "read with a token the ApplicationMaster got itself";
+        write_hdfs_file(&hdfs, path, content.as_bytes().to_vec()).await;
+        let keytab = upload_resource(
+            &hdfs,
+            &test_dir().join("yarn.keytab"),
+            "/yarn-native-staging/yarn.keytab",
+            LocalResourceType::File,
+            LocalResourceVisibility::Private,
+        )
+        .await;
+        // YARN still needs a token to download the keytab
+        let submitted = hdfs.get_delegation_tokens(&renewer).await.unwrap();
+
+        let (dir, worker_command) = read_hdfs_command("refresh-workers", path);
+        let name = "refresh";
+        let (application_id, mut stream) = start_application_master(
+            client,
+            name,
+            AmOptions {
+                workers: 1,
+                worker_command,
+                credentials: Credentials::from(submitted.clone()),
+                local_resources: vec![("yarn.keytab".to_string(), keytab)],
+                env: vec![
+                    (
+                        "YARN_NATIVE_TEST_PRINCIPAL".to_string(),
+                        "yarn/localhost".to_string(),
+                    ),
+                    (
+                        "YARN_NATIVE_TEST_KEYTAB".to_string(),
+                        "yarn.keytab".to_string(),
+                    ),
+                    ("YARN_NATIVE_TEST_RENEWER".to_string(), renewer.clone()),
+                    (
+                        "KRB5_CONFIG".to_string(),
+                        std::env::var("KRB5_CONFIG").unwrap(),
+                    ),
+                ],
+                ..Default::default()
+            },
+        )
+        .await?;
+        for token in &submitted {
+            hdfs.cancel_delegation_token(token).await.unwrap();
+        }
+        start_workers(&mut stream)?;
+        stop_application_master(client, name, application_id, stream).await?;
         assert_eq!(read_worker_output(&dir), vec![content.to_string()]);
         Ok(())
     }
@@ -335,6 +510,9 @@ mod test {
         // An ApplicationMaster that YARN runs gets its AMRMToken from its token file, so a
         // Kerberos submitter needs no impersonation
         test_application_master_reads_hdfs(&client).await.unwrap();
+        test_application_master_refreshes_tokens(&client)
+            .await
+            .unwrap();
     }
 
     /// An ApplicationMaster gets an HDFS delegation token and hands it to a container, whose

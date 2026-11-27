@@ -65,6 +65,12 @@ mod test {
         test_delegation_tokens(&client, &dfs.url, "127.0.0.1:9000").await;
     }
 
+    /// The URL with `localhost` in place of `127.0.0.1`, for a single NameNode.
+    fn hostname_url(url: &str) -> Option<String> {
+        url.contains("127.0.0.1")
+            .then(|| url.replace("127.0.0.1", "localhost"))
+    }
+
     /// Gets, renews, uses and cancels a delegation token. `client` must use Kerberos.
     async fn test_delegation_tokens(client: &Client, url: &str, expected_service: &str) {
         let tokens = client.get_delegation_tokens("hdfs").await.unwrap();
@@ -72,6 +78,15 @@ mod test {
         let token = &tokens[0];
         assert_eq!(token.kind(), "HDFS_DELEGATION_TOKEN");
         assert_eq!(token.service(), expected_service);
+        if let Some(by_hostname) = hostname_url(url) {
+            let hostname_client = ClientBuilder::new().with_url(&by_hostname).build().unwrap();
+            let hostname_tokens = hostname_client.get_delegation_tokens("hdfs").await.unwrap();
+            assert_eq!(hostname_tokens[0].service(), expected_service);
+            hostname_client
+                .cancel_delegation_token(&hostname_tokens[0])
+                .await
+                .unwrap();
+        }
 
         let now_millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -89,6 +104,13 @@ mod test {
             let _token_guard = EnvVarGuard::set("HADOOP_TOKEN_FILE_LOCATION", token_file);
             let token_client = ClientBuilder::new().with_url(url).build().unwrap();
             test_feature_round_trip(&token_client).await.unwrap();
+
+            // Token services are IP addresses, like Java's, so a client that connects by
+            // hostname finds the token too
+            if let Some(by_hostname) = hostname_url(url) {
+                let hostname_client = ClientBuilder::new().with_url(&by_hostname).build().unwrap();
+                test_feature_round_trip(&hostname_client).await.unwrap();
+            }
 
             client.cancel_delegation_token(token).await.unwrap();
             let cancelled_client = ClientBuilder::new().with_url(url).build().unwrap();

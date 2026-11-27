@@ -1,5 +1,6 @@
 #[cfg(feature = "integration-test")]
 mod test {
+    use std::collections::HashSet;
     use std::future::Future;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -11,7 +12,7 @@ mod test {
         am::{AllocateRequest, AmRmClient},
         client::ApplicationFilter,
         ids::{ApplicationId, ContainerId, NodeId},
-        miniyarn::MiniYarn,
+        miniyarn::{MiniYarn, YarnFeatures},
         records::{
             ApplicationState, ApplicationSubmissionContext, Container, ContainerLaunchContext,
             ContainerState, ContainerStatus, FinalApplicationStatus, NodeState, QueueState,
@@ -49,6 +50,72 @@ mod test {
         test_cluster_info(&client).await.unwrap();
         test_kill_application(&client).await.unwrap();
         test_unmanaged_application_master(&client).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resync_after_resource_manager_restart() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let yarn = MiniYarn::with_features(&HashSet::from([YarnFeatures::Recovery]));
+        let client = YarnClientBuilder::new().build_async().await.unwrap();
+
+        let application_id = submit_unmanaged(&client, "resync-test").await.unwrap();
+        let token = wait_for("the AMRMToken", || async {
+            client.get_am_rm_token(application_id).await.unwrap()
+        })
+        .await;
+        let am = AmRmClientBuilder::new()
+            .with_am_rm_token(token)
+            .build_async()
+            .await
+            .unwrap();
+        am.register_application_master("localhost", 0, None)
+            .await
+            .unwrap();
+
+        // The request reaches the ResourceManager, which then loses it in the restart
+        let response = am
+            .allocate(AllocateRequest {
+                asks: vec![ResourceRequest::new(0, Resource::new(128, 1), 1)],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!response.resynced);
+        let mut containers = response.allocated_containers;
+
+        yarn.restart_resource_manager();
+
+        // The first heartbeat finds the ResourceManager has lost the ApplicationMaster, so the
+        // client registers again and re-sends the outstanding request
+        let response = am.allocate(AllocateRequest::default()).await.unwrap();
+        assert!(response.resynced);
+        containers.extend(response.allocated_containers);
+        let start = Instant::now();
+        while containers.is_empty() {
+            assert!(
+                start.elapsed() < TIMEOUT,
+                "Timed out allocating after a resync"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+            let response = am.allocate(AllocateRequest::default()).await.unwrap();
+            assert!(!response.resynced);
+            containers.extend(response.allocated_containers);
+        }
+        assert_eq!(containers.len(), 1);
+
+        am.unregister_application_master(FinalApplicationStatus::Succeeded, None, None)
+            .await
+            .unwrap();
+        let report = wait_for("the application to finish", || async {
+            client
+                .get_application_report(application_id)
+                .await
+                .ok()
+                .filter(|report| report.state.is_terminal())
+        })
+        .await;
+        assert_eq!(report.final_status, FinalApplicationStatus::Succeeded);
     }
 
     async fn test_cluster_info(client: &YarnClient) -> Result<()> {

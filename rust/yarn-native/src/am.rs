@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hadoop_native::security::user::Token;
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use crate::client::{ClientContext, ClientOptions, RuntimeHolder, client_options_methods};
 use crate::config;
@@ -14,8 +14,8 @@ use crate::proto::yarn::{
 };
 use crate::proxy::ServiceProxy;
 use crate::records::{
-    AmCommand, Container, ContainerStatus, FinalApplicationStatus, NodeReport, Resource,
-    ResourceRequest,
+    ANY_RESOURCE, AmCommand, Container, ContainerStatus, FinalApplicationStatus, NodeReport,
+    Resource, ResourceRequest,
 };
 use crate::resourcemanager::master_protocol::{self, ApplicationMasterProtocol};
 use crate::{Result, YarnError};
@@ -152,7 +152,7 @@ impl AmRmClientBuilder {
         Ok(AmRmClient {
             protocol: Arc::new(ApplicationMasterProtocol::new(proxy)),
             nm_tokens: self.nm_tokens.unwrap_or_default(),
-            last_response_id: Arc::new(tokio::sync::Mutex::new(0)),
+            state: Arc::default(),
             rt_holder: context.rt_holder,
         })
     }
@@ -191,8 +191,189 @@ pub struct AllocateResponse {
     pub available_resources: Resource,
     pub updated_nodes: Vec<NodeReport>,
     pub num_cluster_nodes: i32,
-    /// When set, the ApplicationMaster must resync (register again) or shut down.
+    /// An instruction from the ResourceManager, such as to shut down.
     pub am_command: Option<AmCommand>,
+    /// Whether the ResourceManager had lost this ApplicationMaster, for example after a
+    /// restart or failover, so the client registered again and re-sent its outstanding
+    /// requests, pending releases and blacklist before this heartbeat.
+    pub resynced: bool,
+}
+
+/// Identifies an outstanding container request the way the ResourceManager's scheduler does.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AskKey {
+    priority: i32,
+    resource_name: String,
+    capability: Resource,
+    allocation_request_id: Option<i64>,
+}
+
+impl From<&ResourceRequest> for AskKey {
+    fn from(request: &ResourceRequest) -> Self {
+        Self {
+            priority: request.priority,
+            resource_name: request.resource_name.clone(),
+            capability: request.capability,
+            allocation_request_id: request.allocation_request_id,
+        }
+    }
+}
+
+/// What the ResourceManager knows about this ApplicationMaster, so a heartbeat that failed can
+/// be re-sent and the ResourceManager can be brought back in sync after it loses its state,
+/// like Hadoop's `AMRMClientImpl`.
+#[derive(Debug, Default)]
+struct AllocateState {
+    last_response_id: i32,
+    /// The registration to repeat when the ResourceManager has lost this ApplicationMaster.
+    registration: Option<RegisterApplicationMasterRequestProto>,
+    /// The requests the ResourceManager still holds, kept up to date as containers arrive.
+    asks: HashMap<AskKey, ResourceRequest>,
+    /// Requests not yet acknowledged by a successful allocate.
+    unsent_asks: HashSet<AskKey>,
+    /// Released containers the ResourceManager has not reported as completed yet.
+    pending_releases: HashSet<ContainerId>,
+    unsent_releases: HashSet<ContainerId>,
+    blacklist: HashSet<String>,
+    unsent_blacklist_additions: HashSet<String>,
+    unsent_blacklist_removals: HashSet<String>,
+}
+
+impl AllocateState {
+    /// Records a heartbeat's changes, which stay unsent until an allocate succeeds.
+    fn add_request(&mut self, request: AllocateRequest) {
+        for ask in request.asks {
+            let key = AskKey::from(&ask);
+            self.asks.insert(key.clone(), ask);
+            self.unsent_asks.insert(key);
+        }
+        for container_id in request.releases {
+            self.pending_releases.insert(container_id);
+            self.unsent_releases.insert(container_id);
+        }
+        for host in request.blacklist_additions {
+            self.unsent_blacklist_removals.remove(&host);
+            self.blacklist.insert(host.clone());
+            self.unsent_blacklist_additions.insert(host);
+        }
+        for host in request.blacklist_removals {
+            self.unsent_blacklist_additions.remove(&host);
+            self.blacklist.remove(&host);
+            self.unsent_blacklist_removals.insert(host);
+        }
+    }
+
+    /// Marks everything the ResourceManager should know as unsent, after it lost its state.
+    fn resend_all(&mut self) {
+        self.last_response_id = 0;
+        self.unsent_asks = self.asks.keys().cloned().collect();
+        self.unsent_releases = self.pending_releases.clone();
+        self.unsent_blacklist_additions = self.blacklist.clone();
+        self.unsent_blacklist_removals.clear();
+    }
+
+    fn build_request(&self, progress: f32, tracking_url: Option<String>) -> AllocateRequestProto {
+        let blacklist_request = if self.unsent_blacklist_additions.is_empty()
+            && self.unsent_blacklist_removals.is_empty()
+        {
+            None
+        } else {
+            Some(ResourceBlacklistRequestProto {
+                blacklist_additions: self.unsent_blacklist_additions.iter().cloned().collect(),
+                blacklist_removals: self.unsent_blacklist_removals.iter().cloned().collect(),
+            })
+        };
+        AllocateRequestProto {
+            ask: self
+                .unsent_asks
+                .iter()
+                .filter_map(|key| self.asks.get(key))
+                .cloned()
+                .map(Into::into)
+                .collect(),
+            release: self
+                .unsent_releases
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect(),
+            blacklist_request,
+            response_id: Some(self.last_response_id),
+            progress: Some(progress),
+            tracking_url,
+            ..Default::default()
+        }
+    }
+
+    /// Updates the state after a successful allocate.
+    fn on_response(
+        &mut self,
+        response_id: i32,
+        allocated: &[Container],
+        completed: &[ContainerStatus],
+    ) {
+        self.last_response_id = response_id;
+        self.unsent_releases.clear();
+        self.unsent_blacklist_additions.clear();
+        self.unsent_blacklist_removals.clear();
+        // Requests for no containers only needed to reach the ResourceManager once
+        for key in self.unsent_asks.drain() {
+            if self
+                .asks
+                .get(&key)
+                .is_some_and(|ask| ask.num_containers <= 0)
+            {
+                self.asks.remove(&key);
+            }
+        }
+        for container in allocated {
+            self.remove_satisfied_asks(container);
+        }
+        for status in completed {
+            self.pending_releases.remove(&status.container_id);
+        }
+    }
+
+    /// The scheduler decrements the requests a container satisfies, so do the same: the
+    /// off-switch (`*`) request with the same priority and allocation request ID whose
+    /// capability fits the container, and the request for the container's host with the same
+    /// capability. Rack requests are not tracked down because a container doesn't name its
+    /// rack, so after a resync they may ask for more than needed until the next update.
+    fn remove_satisfied_asks(&mut self, container: &Container) {
+        let fits = |capability: &Resource| {
+            capability.memory_mb <= container.resource.memory_mb
+                && capability.vcores <= container.resource.vcores
+        };
+        let Some(capability) = self
+            .asks
+            .keys()
+            .filter(|key| {
+                key.priority == container.priority
+                    && key.allocation_request_id == container.allocation_request_id
+                    && key.resource_name == ANY_RESOURCE
+                    && fits(&key.capability)
+            })
+            .map(|key| key.capability)
+            .max_by_key(|capability| (capability.memory_mb, capability.vcores))
+        else {
+            return;
+        };
+
+        for resource_name in [ANY_RESOURCE, container.node_id.host.as_str()] {
+            let key = AskKey {
+                priority: container.priority,
+                resource_name: resource_name.to_string(),
+                capability,
+                allocation_request_id: container.allocation_request_id,
+            };
+            if let Some(ask) = self.asks.get_mut(&key) {
+                ask.num_containers -= 1;
+                if ask.num_containers <= 0 && !self.unsent_asks.contains(&key) {
+                    self.asks.remove(&key);
+                }
+            }
+        }
+    }
 }
 
 /// A client to the ResourceManager's scheduler, for an application's ApplicationMaster.
@@ -200,13 +381,18 @@ pub struct AllocateResponse {
 /// The ApplicationMaster registers, then calls [`Self::allocate`] periodically as a heartbeat to
 /// request and release containers, and finally unregisters. Allocated containers are started
 /// with an [`NmClient`](crate::NmClient) that shares this client's [`NmTokenCache`].
+///
+/// Like Hadoop's `AMRMClient`, the client remembers outstanding requests, pending releases and
+/// the blacklist. Changes from a heartbeat that failed are sent with the next one, and when the
+/// ResourceManager has lost the ApplicationMaster, for example after a restart or failover, the
+/// client registers again and re-sends them.
 #[derive(Clone, Debug)]
 pub struct AmRmClient {
     protocol: Arc<ApplicationMasterProtocol>,
     nm_tokens: NmTokenCache,
     // The ResourceManager rejects an allocate whose response ID does not follow the last one,
     // so allocate calls are serialized.
-    last_response_id: Arc<tokio::sync::Mutex<i32>>,
+    state: Arc<tokio::sync::Mutex<AllocateState>>,
     #[allow(dead_code)]
     rt_holder: RuntimeHolder,
 }
@@ -225,18 +411,14 @@ impl AmRmClient {
         rpc_port: i32,
         tracking_url: Option<&str>,
     ) -> Result<RegisterResponse> {
-        let response = self
-            .protocol
-            .register_application_master(RegisterApplicationMasterRequestProto {
-                host: Some(host.to_string()),
-                rpc_port: Some(rpc_port),
-                tracking_url: tracking_url.map(str::to_string),
-                ..Default::default()
-            })
-            .await?;
-        *self.last_response_id.lock().await = 0;
-        self.nm_tokens
-            .insert_all(response.nm_tokens_from_previous_attempts);
+        let request = RegisterApplicationMasterRequestProto {
+            host: Some(host.to_string()),
+            rpc_port: Some(rpc_port),
+            tracking_url: tracking_url.map(str::to_string),
+            ..Default::default()
+        };
+        let mut state = self.state.lock().await;
+        let response = self.register(&mut state, request).await?;
 
         Ok(RegisterResponse {
             maximum_resource_capability: response.maximum_capability.unwrap_or_default().into(),
@@ -249,36 +431,77 @@ impl AmRmClient {
         })
     }
 
+    async fn register(
+        &self,
+        state: &mut AllocateState,
+        request: RegisterApplicationMasterRequestProto,
+    ) -> Result<yarn::RegisterApplicationMasterResponseProto> {
+        let response = self
+            .protocol
+            .register_application_master(request.clone())
+            .await?;
+        state.last_response_id = 0;
+        state.registration = Some(request);
+        self.nm_tokens
+            .insert_all(response.nm_tokens_from_previous_attempts.clone());
+        Ok(response)
+    }
+
+    /// Registers again with the original settings after the ResourceManager lost this
+    /// ApplicationMaster.
+    async fn reregister(&self, state: &mut AllocateState) -> Result<()> {
+        let registration = state.registration.clone().ok_or_else(|| {
+            YarnError::InvalidArgument(
+                "The ApplicationMaster must register before it heartbeats".to_string(),
+            )
+        })?;
+        warn!("ApplicationMaster is out of sync with the ResourceManager, registering again");
+        self.register(state, registration).await?;
+        Ok(())
+    }
+
     /// Sends a heartbeat that asks for and releases containers. NMTokens in the response are
     /// stored in the [`NmTokenCache`], and a rolled AMRMToken is used for new connections.
     pub async fn allocate(&self, request: AllocateRequest) -> Result<AllocateResponse> {
-        let blacklist_request =
-            if request.blacklist_additions.is_empty() && request.blacklist_removals.is_empty() {
-                None
-            } else {
-                Some(ResourceBlacklistRequestProto {
-                    blacklist_additions: request.blacklist_additions,
-                    blacklist_removals: request.blacklist_removals,
-                })
-            };
+        let progress = request.progress;
+        let tracking_url = request.tracking_url.clone();
 
-        let mut last_response_id = self.last_response_id.lock().await;
-        let response = self
+        let mut state = self.state.lock().await;
+        state.add_request(request);
+        let mut resynced = false;
+        let response = match self
             .protocol
-            .allocate(AllocateRequestProto {
-                ask: request.asks.into_iter().map(Into::into).collect(),
-                release: request.releases.into_iter().map(Into::into).collect(),
-                blacklist_request,
-                response_id: Some(*last_response_id),
-                progress: Some(request.progress),
-                tracking_url: request.tracking_url,
-                ..Default::default()
-            })
-            .await?;
-        *last_response_id = response.response_id();
-        drop(last_response_id);
+            .allocate(state.build_request(progress, tracking_url.clone()))
+            .await
+        {
+            Err(YarnError::ApplicationMasterNotRegistered(_)) => {
+                self.reregister(&mut state).await?;
+                state.resend_all();
+                resynced = true;
+                self.protocol
+                    .allocate(state.build_request(progress, tracking_url))
+                    .await?
+            }
+            response => response?,
+        };
 
-        let num_cluster_nodes = response.num_cluster_nodes();
+        let allocated_containers: Vec<Container> = response
+            .allocated_containers
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let completed_containers: Vec<ContainerStatus> = response
+            .completed_container_statuses
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        state.on_response(
+            response.response_id.unwrap_or_default(),
+            &allocated_containers,
+            &completed_containers,
+        );
+        drop(state);
+
         self.nm_tokens.insert_all(response.nm_tokens);
         if let Some(am_rm_token) = response.am_rm_token {
             info!("Received a new AMRMToken");
@@ -292,19 +515,12 @@ impl AmRmClient {
                 .a_m_command
                 .and_then(|command| yarn::AmCommandProto::try_from(command).ok())
                 .map(Into::into),
-            num_cluster_nodes,
-            allocated_containers: response
-                .allocated_containers
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-            completed_containers: response
-                .completed_container_statuses
-                .into_iter()
-                .map(Into::into)
-                .collect(),
+            num_cluster_nodes: response.num_cluster_nodes.unwrap_or_default(),
+            allocated_containers,
+            completed_containers,
             available_resources: response.limit.unwrap_or_default().into(),
             updated_nodes: response.updated_nodes.into_iter().map(Into::into).collect(),
+            resynced,
         })
     }
 
@@ -321,15 +537,22 @@ impl AmRmClient {
             tracking_url: tracking_url.map(str::to_string),
             final_application_status: Some(FinalApplicationStatusProto::from(status) as i32),
         };
+        let mut reregistered = false;
         loop {
-            let response = self
+            match self
                 .protocol
                 .finish_application_master(request.clone())
-                .await?;
-            if response.is_unregistered() {
-                return Ok(());
+                .await
+            {
+                Ok(response) if response.is_unregistered() => return Ok(()),
+                Ok(_) => tokio::time::sleep(UNREGISTER_POLL_INTERVAL).await,
+                Err(YarnError::ApplicationMasterNotRegistered(_)) if !reregistered => {
+                    let mut state = self.state.lock().await;
+                    self.reregister(&mut state).await?;
+                    reregistered = true;
+                }
+                Err(error) => return Err(error),
             }
-            tokio::time::sleep(UNREGISTER_POLL_INTERVAL).await;
         }
     }
 
@@ -397,5 +620,170 @@ mod test {
         assert_eq!(cache.len(), 1);
         let shared = cache.clone();
         assert_eq!(shared.get(&NodeId::new("nm", 1)).unwrap().kind(), "NMToken");
+    }
+
+    fn container(sequence: i64, host: &str, memory_mb: i64, priority: i32) -> Container {
+        Container {
+            id: format!("container_1_0001_01_{sequence:06}")
+                .parse()
+                .unwrap(),
+            node_id: NodeId::new(host, 1),
+            node_http_address: String::new(),
+            resource: Resource::new(memory_mb, 1),
+            priority,
+            container_token: None,
+            allocation_request_id: None,
+        }
+    }
+
+    fn sent_asks(state: &AllocateState) -> HashMap<String, i32> {
+        state
+            .build_request(0.0, None)
+            .ask
+            .into_iter()
+            .map(|ask| (ask.resource_name.unwrap(), ask.num_containers.unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn test_unsent_changes_survive_a_failed_heartbeat() {
+        let mut state = AllocateState::default();
+        state.add_request(AllocateRequest {
+            asks: vec![ResourceRequest::new(1, Resource::new(512, 1), 2)],
+            releases: vec!["container_1_0001_01_000009".parse().unwrap()],
+            blacklist_additions: vec!["bad-host".to_string()],
+            ..Default::default()
+        });
+
+        // Nothing was acknowledged, so a later heartbeat sends everything
+        state.add_request(AllocateRequest::default());
+        let request = state.build_request(0.5, None);
+        assert_eq!(request.ask.len(), 1);
+        assert_eq!(request.release.len(), 1);
+        assert_eq!(
+            request.blacklist_request.unwrap().blacklist_additions,
+            vec!["bad-host"]
+        );
+        assert_eq!(request.response_id, Some(0));
+
+        state.on_response(1, &[], &[]);
+        let request = state.build_request(0.5, None);
+        assert!(request.ask.is_empty());
+        assert!(request.release.is_empty());
+        assert!(request.blacklist_request.is_none());
+        assert_eq!(request.response_id, Some(1));
+    }
+
+    #[test]
+    fn test_allocated_containers_decrement_outstanding_asks() {
+        let mut state = AllocateState::default();
+        let capability = Resource::new(512, 1);
+        let mut on_host = ResourceRequest::new(1, capability, 2);
+        on_host.resource_name = "host-a".to_string();
+        state.add_request(AllocateRequest {
+            asks: vec![ResourceRequest::new(1, capability, 2), on_host],
+            ..Default::default()
+        });
+        state.on_response(1, &[], &[]);
+
+        // The scheduler rounds capabilities up, so a larger container still matches. A
+        // container at another priority does not.
+        state.on_response(
+            2,
+            &[
+                container(1, "host-a", 1024, 1),
+                container(2, "host-b", 512, 7),
+            ],
+            &[],
+        );
+        state.resend_all();
+        assert_eq!(
+            sent_asks(&state),
+            HashMap::from([(ANY_RESOURCE.to_string(), 1), ("host-a".to_string(), 1)])
+        );
+
+        state.on_response(3, &[container(3, "host-a", 512, 1)], &[]);
+        state.resend_all();
+        assert!(sent_asks(&state).is_empty());
+    }
+
+    #[test]
+    fn test_cancelled_asks_are_sent_once() {
+        let mut state = AllocateState::default();
+        state.add_request(AllocateRequest {
+            asks: vec![ResourceRequest::new(1, Resource::new(512, 1), 3)],
+            ..Default::default()
+        });
+        state.on_response(1, &[], &[]);
+        state.add_request(AllocateRequest {
+            asks: vec![ResourceRequest::new(1, Resource::new(512, 1), 0)],
+            ..Default::default()
+        });
+        assert_eq!(
+            sent_asks(&state),
+            HashMap::from([(ANY_RESOURCE.to_string(), 0)])
+        );
+
+        state.on_response(2, &[], &[]);
+        state.resend_all();
+        assert!(sent_asks(&state).is_empty());
+    }
+
+    #[test]
+    fn test_releases_are_pending_until_completed() {
+        let mut state = AllocateState::default();
+        let released: ContainerId = "container_1_0001_01_000004".parse().unwrap();
+        state.add_request(AllocateRequest {
+            releases: vec![released],
+            ..Default::default()
+        });
+        state.on_response(1, &[], &[]);
+
+        state.resend_all();
+        assert_eq!(state.build_request(0.0, None).release.len(), 1);
+
+        state.on_response(
+            1,
+            &[],
+            &[ContainerStatus {
+                container_id: released,
+                state: crate::records::ContainerState::Complete,
+                exit_status: -100,
+                diagnostics: String::new(),
+            }],
+        );
+        state.resend_all();
+        assert!(state.build_request(0.0, None).release.is_empty());
+    }
+
+    #[test]
+    fn test_blacklist_changes_cancel_out_and_resync_sends_the_current_list() {
+        let mut state = AllocateState::default();
+        state.add_request(AllocateRequest {
+            blacklist_additions: vec!["a".to_string(), "b".to_string()],
+            ..Default::default()
+        });
+        state.on_response(1, &[], &[]);
+        state.add_request(AllocateRequest {
+            blacklist_removals: vec!["a".to_string()],
+            blacklist_additions: vec!["c".to_string()],
+            ..Default::default()
+        });
+        state.add_request(AllocateRequest {
+            blacklist_removals: vec!["c".to_string()],
+            ..Default::default()
+        });
+        let blacklist = state.build_request(0.0, None).blacklist_request.unwrap();
+        assert!(blacklist.blacklist_additions.is_empty());
+        let mut removals = blacklist.blacklist_removals;
+        removals.sort();
+        assert_eq!(removals, vec!["a", "c"]);
+
+        state.on_response(2, &[], &[]);
+        state.resend_all();
+        let blacklist = state.build_request(0.0, None).blacklist_request.unwrap();
+        assert_eq!(blacklist.blacklist_additions, vec!["b"]);
+        assert!(blacklist.blacklist_removals.is_empty());
+        assert_eq!(state.build_request(0.0, None).response_id, Some(0));
     }
 }

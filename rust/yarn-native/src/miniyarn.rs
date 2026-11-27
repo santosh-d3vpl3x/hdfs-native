@@ -1,10 +1,9 @@
 use std::{
-    env,
+    collections::HashSet,
+    env, fs,
     io::{BufRead, BufReader},
+    path::Path,
     process::{Child, Command, Stdio},
-};
-#[cfg(unix)]
-use std::{
     thread,
     time::{Duration, Instant},
 };
@@ -15,16 +14,41 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(unix)]
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+const RESTART_TRIGGER: &str = "target/test/restart-rm";
+const RESTART_DONE: &str = "target/test/rm-restarted";
+const RESTART_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum YarnFeatures {
+    /// ResourceManager recovery with a state store on disk, so
+    /// [`MiniYarn::restart_resource_manager`] keeps running applications.
+    Recovery,
+}
+
+impl YarnFeatures {
+    pub fn as_str(&self) -> &str {
+        match self {
+            YarnFeatures::Recovery => "recovery",
+        }
+    }
+}
+
 /// A MiniYARNCluster with one ResourceManager and one NodeManager, for integration tests.
 ///
 /// Starting it writes the cluster's `yarn-site.xml` to `target/test` and points
 /// `HADOOP_CONF_DIR` there, so clients built with default settings connect to it.
 pub struct MiniYarn {
+    features: HashSet<YarnFeatures>,
     process: Child,
 }
 
 impl MiniYarn {
     pub fn new() -> Self {
+        Self::with_features(&HashSet::new())
+    }
+
+    pub fn with_features(features: &HashSet<YarnFeatures>) -> Self {
+        let feature_args: Vec<&str> = features.iter().map(YarnFeatures::as_str).collect();
         let mvn_exec = which("mvn").expect("Failed to find mvn executable");
 
         let mut command = Command::new(mvn_exec);
@@ -36,7 +60,10 @@ impl MiniYarn {
                 "--errors",
                 "compile",
                 "exec:exec",
-                "-Dexec.args=-cp %classpath main.Main",
+                &format!(
+                    "-Dexec.args=-cp %classpath main.Main {}",
+                    feature_args.join(" ")
+                ),
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -67,7 +94,30 @@ impl MiniYarn {
         // Make sure an AMRMToken file from another test isn't picked up
         unsafe { env::remove_var("HADOOP_TOKEN_FILE_LOCATION") };
         unsafe { env::set_var("HADOOP_CONF_DIR", "target/test") };
-        MiniYarn { process: child }
+        MiniYarn {
+            features: features.clone(),
+            process: child,
+        }
+    }
+
+    /// Restarts the ResourceManager and waits until the NodeManager has registered with it
+    /// again. The cluster must have [`YarnFeatures::Recovery`].
+    pub fn restart_resource_manager(&self) {
+        assert!(
+            self.features.contains(&YarnFeatures::Recovery),
+            "restarting the ResourceManager needs YarnFeatures::Recovery"
+        );
+        let _ = fs::remove_file(RESTART_DONE);
+        fs::write(RESTART_TRIGGER, b"").unwrap();
+        let start = Instant::now();
+        while !Path::new(RESTART_DONE).exists() {
+            assert!(
+                start.elapsed() < RESTART_TIMEOUT,
+                "Timed out restarting the ResourceManager"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+        fs::remove_file(RESTART_DONE).unwrap();
     }
 }
 

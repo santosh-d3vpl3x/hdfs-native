@@ -333,7 +333,7 @@ impl AllocateState {
         self.unsent_releases.clear();
         self.unsent_blacklist_additions.clear();
         self.unsent_blacklist_removals.clear();
-        let sent: HashSet<AskKey> = self.unsent_asks.drain().collect();
+        let sent = std::mem::take(&mut self.unsent_asks);
         for container in allocated {
             self.remove_satisfied_asks(container, &sent);
         }

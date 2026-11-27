@@ -8,6 +8,10 @@ pub(crate) const PROTOCOL: Protocol = Protocol {
 };
 
 /// The ResourceManager's client protocol, used to submit and inspect applications.
+///
+/// Each call says whether it is a `write` that must not be repeated after an ambiguous failure.
+/// Calls Hadoop annotates `@Idempotent` are not: like Hadoop's `RMProxy`, they fail over to
+/// another ResourceManager even when the connection broke after the request was sent.
 #[derive(Debug)]
 pub(crate) struct ApplicationClientProtocol {
     proxy: ServiceProxy,
@@ -40,7 +44,7 @@ impl ApplicationClientProtocol {
         let message = yarn::SubmitApplicationRequestProto {
             application_submission_context: Some(context),
         };
-        self.proxy.call("submitApplication", message, true).await
+        self.proxy.call("submitApplication", message, false).await
     }
 
     pub(crate) async fn get_application_report(
@@ -71,7 +75,9 @@ impl ApplicationClientProtocol {
             application_id: Some(application_id),
             diagnostics,
         };
-        self.proxy.call("forceKillApplication", message, true).await
+        self.proxy
+            .call("forceKillApplication", message, false)
+            .await
     }
 
     pub(crate) async fn fail_application_attempt(
@@ -96,7 +102,7 @@ impl ApplicationClientProtocol {
             target_queue,
         };
         self.proxy
-            .call("moveApplicationAcrossQueues", message, true)
+            .call("moveApplicationAcrossQueues", message, false)
             .await
     }
 
@@ -112,7 +118,7 @@ impl ApplicationClientProtocol {
             },
         };
         self.proxy
-            .call("updateApplicationPriority", message, true)
+            .call("updateApplicationPriority", message, false)
             .await
     }
 
@@ -214,7 +220,7 @@ impl ApplicationClientProtocol {
         renewer: String,
     ) -> Result<common::GetDelegationTokenResponseProto> {
         let message = common::GetDelegationTokenRequestProto { renewer };
-        self.proxy.call("getDelegationToken", message, true).await
+        self.proxy.call("getDelegationToken", message, false).await
     }
 
     pub(crate) async fn renew_delegation_token(
@@ -222,7 +228,9 @@ impl ApplicationClientProtocol {
         token: common::TokenProto,
     ) -> Result<common::RenewDelegationTokenResponseProto> {
         let message = common::RenewDelegationTokenRequestProto { token };
-        self.proxy.call("renewDelegationToken", message, true).await
+        self.proxy
+            .call("renewDelegationToken", message, false)
+            .await
     }
 
     pub(crate) async fn cancel_delegation_token(
@@ -231,7 +239,7 @@ impl ApplicationClientProtocol {
     ) -> Result<common::CancelDelegationTokenResponseProto> {
         let message = common::CancelDelegationTokenRequestProto { token };
         self.proxy
-            .call("cancelDelegationToken", message, true)
+            .call("cancelDelegationToken", message, false)
             .await
     }
 }

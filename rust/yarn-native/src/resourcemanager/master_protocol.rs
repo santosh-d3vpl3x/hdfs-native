@@ -59,8 +59,10 @@ impl ApplicationMasterProtocol {
         &self,
         message: yarn::FinishApplicationMasterRequestProto,
     ) -> Result<yarn::FinishApplicationMasterResponseProto> {
+        // Hadoop marks this @AtMostOnce: the ResourceManager recognizes a repeated request,
+        // so it can be retried like Hadoop's RMProxy does
         self.proxy
-            .call("finishApplicationMaster", message, true)
+            .call("finishApplicationMaster", message, false)
             .await
     }
 }

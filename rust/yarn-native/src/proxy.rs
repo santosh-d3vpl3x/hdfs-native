@@ -194,7 +194,7 @@ impl ServiceProxy {
         );
 
         let token = Arc::new(Mutex::new(token));
-        let proxy_connections = addresses
+        let proxy_connections: Vec<ProxyConnection> = addresses
             .into_iter()
             .map(|address| ProxyConnection {
                 // Like Hadoop's token selectors, look tokens up by this server's own service
@@ -209,6 +209,14 @@ impl ServiceProxy {
                 handle: handle.clone(),
             })
             .collect();
+
+        // Try every server at least once, even when the retry settings allow no failovers
+        let failover = FailoverSettings {
+            max_attempts: failover
+                .max_attempts
+                .max(proxy_connections.len() as u32 - 1),
+            ..failover
+        };
 
         Ok(Self {
             proxy_connections,
@@ -537,6 +545,16 @@ mod tests {
         assert!(matches!(error, YarnError::IOError(_)), "{error:?}");
         // Neither server answered, so the active index is unchanged
         assert_eq!(proxy.current_active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_every_server_is_tried_at_least_once() {
+        // Retry settings that allow no failovers, such as a max wait shorter than the retry
+        // interval, still let an HA client reach the second ResourceManager
+        assert_eq!(proxy(closed_addresses(2), 0).failover.max_attempts, 1);
+        assert_eq!(proxy(closed_addresses(3), 0).failover.max_attempts, 2);
+        assert_eq!(proxy(closed_addresses(1), 0).failover.max_attempts, 0);
+        assert_eq!(proxy(closed_addresses(2), 5).failover.max_attempts, 5);
     }
 
     #[test]

@@ -47,7 +47,10 @@ mod test {
         let _yarn = MiniYarn::default();
         let client = YarnClientBuilder::new().build_async().await.unwrap();
 
-        test_cluster_info(&client).await.unwrap();
+        // Without Kerberos, the ResourceManager knows the client as its OS user
+        test_cluster_info(&client, &whoami::username().unwrap())
+            .await
+            .unwrap();
         test_kill_application(&client).await.unwrap();
         test_unmanaged_application_master(&client).await.unwrap();
     }
@@ -118,7 +121,136 @@ mod test {
         assert_eq!(report.final_status, FinalApplicationStatus::Succeeded);
     }
 
-    async fn test_cluster_info(client: &YarnClient) -> Result<()> {
+    #[tokio::test]
+    #[serial]
+    async fn test_security_kerberos() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let _yarn = MiniYarn::with_features(&HashSet::from([YarnFeatures::Security]));
+        let client = YarnClientBuilder::new().build_async().await.unwrap();
+
+        // The client authenticates as yarn/localhost, which the ResourceManager knows as yarn
+        test_cluster_info(&client, "yarn").await.unwrap();
+        test_kill_application(&client).await.unwrap();
+
+        // The ResourceManager only returns an unmanaged AMRMToken to a caller whose user name is
+        // the application's user, which a Kerberos principal's full name never is. Submitting
+        // as an impersonated user, like a gateway service would, makes them match.
+        let proxy_client = YarnClientBuilder::new()
+            .with_user("yarn")
+            .build_async()
+            .await
+            .unwrap();
+        test_container_reads_hdfs_with_a_delegation_token(&proxy_client)
+            .await
+            .unwrap();
+    }
+
+    /// An ApplicationMaster gets an HDFS delegation token and hands it to a container, whose
+    /// Hadoop client reads Kerberized HDFS with it. A container without the token cannot.
+    async fn test_container_reads_hdfs_with_a_delegation_token(client: &YarnClient) -> Result<()> {
+        let hdfs = hdfs_native::ClientBuilder::new().build().unwrap();
+        let path = "/yarn-native-input";
+        let content = b"read by a container with a delegation token";
+        let mut writer = hdfs
+            .create(path, hdfs_native::WriteOptions::default().overwrite(true))
+            .await
+            .unwrap();
+        writer
+            .write_bytes(bytes::Bytes::from_static(content))
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        let hdfs_tokens = hdfs.get_delegation_tokens("yarn").await.unwrap();
+
+        let application_id = submit_unmanaged(client, "secure-container-test").await?;
+        let token = wait_for("the AMRMToken", || async {
+            client.get_am_rm_token(application_id).await.unwrap()
+        })
+        .await;
+        let am = AmRmClientBuilder::new()
+            .with_am_rm_token(token)
+            .build_async()
+            .await?;
+        am.register_application_master("localhost", 0, None).await?;
+        let containers = allocate_containers(&am, 2).await?;
+        let nm = NmClientBuilder::new()
+            .with_nm_token_cache(am.nm_token_cache())
+            .build_async()
+            .await?;
+
+        let hadoop = which::which("hadoop").expect("Failed to find hadoop executable");
+        let test_dir = std::env::current_dir().unwrap().join("target/test");
+        let read_hdfs = |name: &str| {
+            let mut context = ContainerLaunchContext::default()
+                .commands([
+                    hadoop.to_str().unwrap().to_string(),
+                    "fs".to_string(),
+                    "-cat".to_string(),
+                    path.to_string(),
+                    ">".to_string(),
+                    test_dir
+                        .join(format!("{name}.out"))
+                        .to_str()
+                        .unwrap()
+                        .to_string(),
+                    "2>".to_string(),
+                    test_dir
+                        .join(format!("{name}.err"))
+                        .to_str()
+                        .unwrap()
+                        .to_string(),
+                ])
+                .env("HADOOP_CONF_DIR", test_dir.to_str().unwrap())
+                .env("HADOOP_OPTS", std::env::var("HADOOP_OPTS").unwrap());
+            if let Ok(java_home) = std::env::var("JAVA_HOME") {
+                context = context.env("JAVA_HOME", java_home);
+            }
+            context
+        };
+
+        let with_token = &containers[0];
+        nm.start_container(
+            with_token,
+            read_hdfs("with-token").credentials(Credentials::from(hdfs_tokens)),
+        )
+        .await?;
+        let without_token = &containers[1];
+        nm.start_container(without_token, read_hdfs("without-token"))
+            .await?;
+
+        let status = wait_for_container_state(
+            &nm,
+            with_token.id,
+            &with_token.node_id,
+            ContainerState::Complete,
+        )
+        .await;
+        assert_eq!(
+            status.exit_status,
+            0,
+            "{}",
+            std::fs::read_to_string(test_dir.join("with-token.err")).unwrap_or_default()
+        );
+        assert_eq!(
+            std::fs::read(test_dir.join("with-token.out"))?,
+            content.to_vec()
+        );
+
+        let status = wait_for_container_state(
+            &nm,
+            without_token.id,
+            &without_token.node_id,
+            ContainerState::Complete,
+        )
+        .await;
+        assert_ne!(status.exit_status, 0);
+
+        am.unregister_application_master(FinalApplicationStatus::Succeeded, None, None)
+            .await?;
+        Ok(())
+    }
+
+    async fn test_cluster_info(client: &YarnClient, user: &str) -> Result<()> {
         let metrics = client.get_cluster_metrics().await?;
         assert_eq!(metrics.num_node_managers, 1);
         assert_eq!(metrics.num_active_node_managers, 1);
@@ -133,7 +265,7 @@ mod test {
         assert_eq!(queue.queue_name, "default");
         assert_eq!(queue.state, QueueState::Running);
 
-        test_delegation_tokens(client).await?;
+        test_delegation_tokens(client, user).await?;
 
         let missing = client
             .get_application_report(ApplicationId::new(1, 9999))
@@ -145,10 +277,9 @@ mod test {
         Ok(())
     }
 
-    async fn test_delegation_tokens(client: &YarnClient) -> Result<()> {
-        // Without Kerberos the ResourceManager still issues tokens. Only the renewer may renew.
-        let renewer = whoami::username().unwrap();
-        let token = client.get_delegation_token(&renewer).await?;
+    /// `renewer` must be the client's user, since only the renewer may renew.
+    async fn test_delegation_tokens(client: &YarnClient, renewer: &str) -> Result<()> {
+        let token = client.get_delegation_token(renewer).await?;
         assert_eq!(token.kind(), "RM_DELEGATION_TOKEN");
         let address = std::fs::read_to_string("target/test/yarn-site.xml")?;
         let port = token.service().rsplit_once(':').unwrap().1;

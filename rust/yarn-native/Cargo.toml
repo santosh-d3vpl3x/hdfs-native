@@ -28,7 +28,9 @@ prost-build = { version = "0.14", optional = true }
 protobuf-src = { version = "2", optional = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
 env_logger = { workspace = true }
+hdfs-native = { path = "../hdfs-native" }
 serial_test = "4"
 whoami = "2"
 tokio = { workspace = true, features = ["macros"] }

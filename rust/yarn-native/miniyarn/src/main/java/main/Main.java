@@ -6,7 +6,15 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hdfs.DFSConfigKeys;
+import org.apache.hadoop.hdfs.HdfsConfiguration;
+import org.apache.hadoop.hdfs.MiniDFSCluster;
+import org.apache.hadoop.minikdc.MiniKdc;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
+
+import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.*;
 import org.apache.hadoop.yarn.server.MiniYARNCluster;
 
 public class Main {
@@ -26,6 +34,49 @@ public class Main {
         RESTART_DONE.delete();
 
         YarnConfiguration conf = new YarnConfiguration();
+
+        MiniKdc kdc = null;
+        MiniDFSCluster dfs = null;
+        if (flags.contains("security")) {
+            kdc = new MiniKdc(MiniKdc.createConf(), new File("target/test/kdc"));
+            kdc.setTransport("UDP");
+            kdc.start();
+            // The services and the tests all authenticate as yarn/localhost. createPrincipal
+            // overwrites the keytab file, so all principals must be created in one call.
+            String keytab = new File("target/test/yarn.keytab").getAbsolutePath();
+            kdc.createPrincipal(new File(keytab), "yarn/localhost", "HTTP/localhost");
+            String principal = "yarn/localhost@" + kdc.getRealm();
+
+            conf.set(HADOOP_SECURITY_AUTHENTICATION, "kerberos");
+            conf.set(HADOOP_SECURITY_AUTHORIZATION, "true");
+            conf.set(HADOOP_RPC_PROTECTION, "authentication");
+            // The ResourceManager only hands an unmanaged ApplicationMaster's AMRMToken to a caller
+            // whose user name equals the application's user. A Kerberos principal's full name
+            // never does, so let yarn/localhost impersonate users, as gateway services do.
+            conf.set("hadoop.proxyuser.yarn.users", "*");
+            conf.set("hadoop.proxyuser.yarn.hosts", "*");
+            conf.set(YarnConfiguration.RM_PRINCIPAL, principal);
+            conf.set(YarnConfiguration.RM_KEYTAB, keytab);
+            conf.set(YarnConfiguration.NM_PRINCIPAL, principal);
+            conf.set(YarnConfiguration.NM_KEYTAB, keytab);
+            UserGroupInformation.setConfiguration(conf);
+
+            // A Kerberized HDFS, so containers can be tested reading it with a delegation token
+            conf.set(DFSConfigKeys.DFS_NAMENODE_KEYTAB_FILE_KEY, keytab);
+            conf.set(DFSConfigKeys.DFS_NAMENODE_KERBEROS_PRINCIPAL_KEY, principal);
+            conf.set(DFSConfigKeys.DFS_DATANODE_KEYTAB_FILE_KEY, keytab);
+            conf.set(DFSConfigKeys.DFS_DATANODE_KERBEROS_PRINCIPAL_KEY, principal);
+            conf.set(DFSConfigKeys.DFS_BLOCK_ACCESS_TOKEN_ENABLE_KEY, "true");
+            conf.set(DFSConfigKeys.DFS_DATA_TRANSFER_PROTECTION_KEY, "authentication");
+            conf.set(DFSConfigKeys.IGNORE_SECURE_PORTS_FOR_TESTING_KEY, "true");
+            HdfsConfiguration hdfsConf = new HdfsConfiguration(conf);
+            dfs = new MiniDFSCluster.Builder(hdfsConf)
+                .nameNodePort(19000)
+                .numDataNodes(1)
+                .build();
+            dfs.waitActive();
+            conf.set(FS_DEFAULT_NAME_KEY, "hdfs://127.0.0.1:19000");
+        }
         // Small containers so tests fit on any machine
         conf.setInt(YarnConfiguration.RM_SCHEDULER_MINIMUM_ALLOCATION_MB, 64);
         conf.setInt(YarnConfiguration.NM_PMEM_MB, 4096);
@@ -71,13 +122,36 @@ public class Main {
 
         // The cluster's config holds the ports it bound
         yarn.getConfig().writeXml(new FileOutputStream("target/test/yarn-site.xml"));
+        File coreSite = new File("target/test/core-site.xml");
+        if (dfs != null) {
+            // The security and HDFS settings, for clients and for Hadoop commands in containers
+            conf.writeXml(new FileOutputStream(coreSite));
+        } else {
+            coreSite.delete();
+        }
 
         final MiniYARNCluster shutdownYarn = yarn;
+        final MiniDFSCluster shutdownDfs = dfs;
+        final MiniKdc shutdownKdc = kdc;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
                 shutdownYarn.stop();
             } catch (Exception e) {
                 e.printStackTrace(System.err);
+            }
+            if (shutdownDfs != null) {
+                try {
+                    shutdownDfs.close();
+                } catch (Exception e) {
+                    e.printStackTrace(System.err);
+                }
+            }
+            if (shutdownKdc != null) {
+                try {
+                    shutdownKdc.stop();
+                } catch (Exception e) {
+                    e.printStackTrace(System.err);
+                }
             }
         }, "miniyarn-shutdown"));
 
@@ -88,6 +162,9 @@ public class Main {
         }
 
         System.out.println("Ready!");
+        if (kdc != null) {
+            System.out.println(kdc.getKrb5conf().toPath().toString());
+        }
 
         // SIGTERM triggers the JVM shutdown hook above, which stops the cluster.
         new CountDownLatch(1).await();

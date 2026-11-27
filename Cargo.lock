@@ -3253,6 +3253,7 @@ dependencies = [
  "bytes",
  "env_logger",
  "hadoop-native",
+ "hdfs-native",
  "libc",
  "log",
  "prost",

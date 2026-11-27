@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     env, fs,
     io::{BufRead, BufReader},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -23,12 +23,16 @@ pub enum YarnFeatures {
     /// ResourceManager recovery with a state store on disk, so
     /// [`MiniYarn::restart_resource_manager`] keeps running applications.
     Recovery,
+    /// Kerberos for the ResourceManager and NodeManager, plus a Kerberized HDFS at
+    /// `hdfs://127.0.0.1:19000`. Clients authenticate as `yarn/localhost`.
+    Security,
 }
 
 impl YarnFeatures {
     pub fn as_str(&self) -> &str {
         match self {
             YarnFeatures::Recovery => "recovery",
+            YarnFeatures::Security => "security",
         }
     }
 }
@@ -93,10 +97,52 @@ impl MiniYarn {
 
         // Make sure an AMRMToken file from another test isn't picked up
         unsafe { env::remove_var("HADOOP_TOKEN_FILE_LOCATION") };
+
+        if features.contains(&YarnFeatures::Security) {
+            let krb_conf = output.next().unwrap().unwrap();
+            Self::kdestroy();
+
+            if !PathBuf::from("target/test/yarn.keytab").exists() {
+                panic!("Failed to find keytab");
+            }
+
+            if !PathBuf::from(&krb_conf).exists() {
+                panic!("Failed to find krb5.conf");
+            }
+
+            unsafe {
+                env::set_var("KRB5_CONFIG", &krb_conf);
+                env::set_var(
+                    "HADOOP_OPTS",
+                    format!("-Djava.security.krb5.conf={}", krb_conf),
+                );
+            }
+
+            let kinit_exec = which("kinit").expect("Failed to find kinit executable");
+            unsafe { env::set_var("KRB5CCNAME", "FILE:target/test/krbcache") };
+            Command::new(kinit_exec)
+                .args(["-kt", "target/test/yarn.keytab", "yarn/localhost"])
+                .spawn()
+                .unwrap()
+                .wait()
+                .unwrap();
+        }
         unsafe { env::set_var("HADOOP_CONF_DIR", "target/test") };
         MiniYarn {
             features: features.clone(),
             process: child,
+        }
+    }
+
+    fn kdestroy() {
+        if let Ok(kdestroy_exec) = which("kdestroy") {
+            Command::new(kdestroy_exec)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+                .wait()
+                .unwrap();
         }
     }
 
@@ -132,6 +178,10 @@ impl Drop for MiniYarn {
         println!("Dropping and killing miniyarn");
         terminate_process_tree(&mut self.process);
         let _ = self.process.wait();
+
+        if self.features.contains(&YarnFeatures::Security) {
+            Self::kdestroy();
+        }
     }
 }
 

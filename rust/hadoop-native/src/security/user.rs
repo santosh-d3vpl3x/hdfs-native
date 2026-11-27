@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use whoami::username;
 
 use crate::HadoopError as HdfsError;
-use crate::proto::common::CredentialsProto;
 use crate::proto::common::TokenProto;
+use crate::proto::common::{CredentialsKvProto, CredentialsProto};
 use crate::security::gssapi::GssapiSession;
 
 const HADOOP_USER_NAME: &str = "HADOOP_USER_NAME";
@@ -146,9 +146,105 @@ impl Token {
         }
     }
 
-    /// Reads a Hadoop credentials file in either the Writable or the protobuf format.
+    /// Reads the tokens in a Hadoop credentials file in either the Writable or the protobuf
+    /// format.
     pub fn read_token_file(path: &Path) -> std::io::Result<Vec<Self>> {
-        let mut content = Bytes::from(fs::read(path)?);
+        Ok(Credentials::read_token_file(path)?.tokens)
+    }
+}
+
+/// How a [`Credentials`] file is encoded. Hadoop reads both; Java's `Credentials` writes
+/// [`SerializedFormat::Writable`] unless asked otherwise.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SerializedFormat {
+    #[default]
+    Writable,
+    Protobuf,
+}
+
+impl SerializedFormat {
+    fn tag(&self) -> u8 {
+        match self {
+            Self::Writable => 0,
+            Self::Protobuf => 1,
+        }
+    }
+}
+
+/// Tokens and secret keys keyed by alias, as stored in a Hadoop token file such as the one in
+/// `HADOOP_TOKEN_FILE_LOCATION`. Matches Hadoop's `Credentials`: adding an entry under an
+/// existing alias replaces it.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Credentials {
+    tokens: Vec<Token>,
+    secret_keys: Vec<(String, Vec<u8>)>,
+}
+
+impl Credentials {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a token under `alias`, replacing any token with the same alias. Hadoop usually
+    /// uses the token's service as its alias.
+    pub fn add_token(&mut self, alias: impl Into<String>, mut token: Token) {
+        token.alias = alias.into();
+        match self.tokens.iter_mut().find(|t| t.alias == token.alias) {
+            Some(existing) => *existing = token,
+            None => self.tokens.push(token),
+        }
+    }
+
+    /// The token stored under `alias`.
+    pub fn token(&self, alias: &str) -> Option<&Token> {
+        self.tokens.iter().find(|token| token.alias == alias)
+    }
+
+    /// All tokens, in the order they were added or read.
+    pub fn tokens(&self) -> &[Token] {
+        &self.tokens
+    }
+
+    /// Adds a secret key under `alias`, replacing any key with the same alias.
+    pub fn add_secret_key(&mut self, alias: impl Into<String>, key: Vec<u8>) {
+        let alias = alias.into();
+        match self.secret_keys.iter_mut().find(|(a, _)| *a == alias) {
+            Some((_, existing)) => *existing = key,
+            None => self.secret_keys.push((alias, key)),
+        }
+    }
+
+    /// The secret key stored under `alias`.
+    pub fn secret_key(&self, alias: &str) -> Option<&[u8]> {
+        self.secret_keys
+            .iter()
+            .find(|(a, _)| a == alias)
+            .map(|(_, key)| key.as_slice())
+    }
+
+    /// Adds every token and secret key in `other`, replacing entries with the same alias.
+    pub fn merge(&mut self, other: Credentials) {
+        for token in other.tokens {
+            self.add_token(token.alias.clone(), token);
+        }
+        for (alias, key) in other.secret_keys {
+            self.add_secret_key(alias, key);
+        }
+    }
+
+    /// Reads a Hadoop credentials file in either the Writable or the protobuf format.
+    pub fn read_token_file(path: &Path) -> io::Result<Self> {
+        Self::from_bytes(&fs::read(path)?)
+    }
+
+    /// Writes a Hadoop credentials file that Java's `Credentials.readTokenStorageFile` reads.
+    pub fn write_token_file(&self, path: &Path, format: SerializedFormat) -> io::Result<()> {
+        fs::write(path, self.to_bytes(format))
+    }
+
+    /// Parses the contents of a Hadoop credentials file in either format.
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
+        let mut content = Bytes::copy_from_slice(bytes);
 
         ensure_remaining(&content, 5)?;
         let magic = content.copy_to_bytes(4);
@@ -163,9 +259,9 @@ impl Token {
 
         let format = content.copy_to_bytes(1);
 
-        if format[0] == 0 {
+        if format[0] == SerializedFormat::Writable.tag() {
             Self::parse_writable(&mut content)
-        } else if format[0] == 1 {
+        } else if format[0] == SerializedFormat::Protobuf.tag() {
             Self::parse_protobuf(content)
         } else {
             Err(io::Error::new(
@@ -175,7 +271,20 @@ impl Token {
         }
     }
 
-    fn parse_writable(reader: &mut impl Buf) -> io::Result<Vec<Token>> {
+    /// Serializes the credentials like Java's `Credentials.writeTokenStorageToStream`. This is
+    /// also the format YARN expects in a container launch context's tokens.
+    pub fn to_bytes(&self, format: SerializedFormat) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(TOKEN_STORAGE_MAGIC);
+        buf.push(format.tag());
+        match format {
+            SerializedFormat::Writable => self.write_writable(&mut buf),
+            SerializedFormat::Protobuf => self.write_protobuf(&mut buf),
+        }
+        buf
+    }
+
+    fn parse_writable(reader: &mut impl Buf) -> io::Result<Self> {
         let token_count = parse_length(reader)?;
         let mut tokens = Vec::<Token>::with_capacity(token_count.min(1024));
 
@@ -199,10 +308,26 @@ impl Token {
             })
         }
 
-        Ok(tokens)
+        // Files written by older Hadoop versions may end after the tokens
+        let mut secret_keys = Vec::new();
+        if reader.has_remaining() {
+            let key_count = parse_length(reader)?;
+            secret_keys.reserve(key_count.min(1024));
+            for _ in 0..key_count {
+                let alias = String::from_utf8(parse_bytes(reader)?)
+                    .map_err(|_| io::Error::other("Failed to parse secret key".to_string()))?;
+                let key = parse_bytes(reader)?;
+                secret_keys.push((alias, key));
+            }
+        }
+
+        Ok(Self {
+            tokens,
+            secret_keys,
+        })
     }
 
-    fn parse_protobuf(reader: impl Buf) -> io::Result<Vec<Token>> {
+    fn parse_protobuf(reader: impl Buf) -> io::Result<Self> {
         let storage = CredentialsProto::decode_length_delimited(reader)?;
 
         let tokens: Vec<Token> = storage
@@ -219,7 +344,86 @@ impl Token {
             })
             .collect();
 
-        Ok(tokens)
+        let secret_keys = storage
+            .secrets
+            .into_iter()
+            .filter_map(|secret| secret.secret.map(|key| (secret.alias, key)))
+            .collect();
+
+        Ok(Self {
+            tokens,
+            secret_keys,
+        })
+    }
+
+    fn write_writable(&self, buf: &mut Vec<u8>) {
+        write_vlong(buf, self.tokens.len() as i64);
+        for token in &self.tokens {
+            write_bytes(buf, token.alias.as_bytes());
+            write_bytes(buf, &token.identifier);
+            write_bytes(buf, &token.password);
+            write_bytes(buf, token.kind.as_bytes());
+            write_bytes(buf, token.service.as_bytes());
+        }
+
+        write_vlong(buf, self.secret_keys.len() as i64);
+        for (alias, key) in &self.secret_keys {
+            write_bytes(buf, alias.as_bytes());
+            write_bytes(buf, key);
+        }
+    }
+
+    fn write_protobuf(&self, buf: &mut Vec<u8>) {
+        let storage = CredentialsProto {
+            tokens: self
+                .tokens
+                .iter()
+                .map(|token| CredentialsKvProto {
+                    alias: token.alias.clone(),
+                    token: Some(token.to_proto()),
+                    secret: None,
+                })
+                .collect(),
+            secrets: self
+                .secret_keys
+                .iter()
+                .map(|(alias, key)| CredentialsKvProto {
+                    alias: alias.clone(),
+                    token: None,
+                    secret: Some(key.clone()),
+                })
+                .collect(),
+        };
+        storage
+            .encode_length_delimited(buf)
+            .expect("a Vec has unlimited capacity");
+    }
+}
+
+impl From<Vec<Token>> for Credentials {
+    /// Collects tokens, using each token's service as its alias.
+    fn from(tokens: Vec<Token>) -> Self {
+        let mut credentials = Self::new();
+        for token in tokens {
+            credentials.add_token(token.service.clone(), token);
+        }
+        credentials
+    }
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("tokens", &self.tokens)
+            .field(
+                "secret_keys",
+                &self
+                    .secret_keys
+                    .iter()
+                    .map(|(alias, _)| alias.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
     }
 }
 
@@ -273,6 +477,42 @@ fn parse_bytes(reader: &mut impl Buf) -> io::Result<Vec<u8>> {
     let length = parse_length(reader)?;
     ensure_remaining(reader, length)?;
     Ok(reader.copy_to_bytes(length).to_vec())
+}
+
+/// Adapted from WritableUtils.writeVLong in Hadoop
+fn write_vlong(buf: &mut Vec<u8>, value: i64) {
+    if (-112..=127).contains(&value) {
+        buf.push(value as u8);
+        return;
+    }
+
+    let mut value = value;
+    let mut length: i64 = -112;
+    if value < 0 {
+        value ^= -1;
+        length = -120;
+    }
+    let mut tmp = value;
+    while tmp != 0 {
+        tmp >>= 8;
+        length -= 1;
+    }
+    buf.push(length as u8);
+
+    let byte_count = if length < -120 {
+        -(length + 120)
+    } else {
+        -(length + 112)
+    };
+    for index in (0..byte_count).rev() {
+        buf.push((value >> (index * 8)) as u8);
+    }
+}
+
+/// Write a byte array prefixed with its length as a vint, like Hadoop's `Text` and `Token`.
+fn write_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    write_vlong(buf, bytes.len() as i64);
+    buf.extend_from_slice(bytes);
 }
 
 /// Adapted from WritableUtils class in Hadoop
@@ -546,5 +786,109 @@ mod tests {
     fn test_token_proto_round_trip() {
         let token = Token::new(b"id".to_vec(), b"pw".to_vec(), "KIND", "svc");
         assert_eq!(Token::from(token.to_proto()), token);
+    }
+
+    /// Token files written by Java, in the Writable and protobuf formats.
+    const JAVA_WRITABLE_TOKEN_FILE: &str = "SERUUwABDjEyNy4wLjAuMTo5MDAwLgAaaGRmcy9sb2NhbGhvc3RARVhBTVBMRS5DT00AAIoBiX/hghSKAYmj7gYUAQIUadF4ni3ObKqU8niv40WBFsGhFm4VSERGU19ERUxFR0FUSU9OX1RPS0VODjEyNy4wLjAuMTo5MDAwAA==";
+    const JAVA_PROTOBUF_TOKEN_FILE: &str = "SERUUwGBAQp/Cg5sb2NhbGhvc3Q6OTAwMBJtCi4AGmhkZnMvbG9jYWxob3N0QEVYQU1QTEUuQ09NAACKAYiiTtt9igGIxltffQECEhQoROcYNFMxMuoK9UHlAna6ZmhQSBoVSERGU19ERUxFR0FUSU9OX1RPS0VOIg4xMjcuMC4wLjE6OTAwMA==";
+
+    fn decode(b64: &str) -> Vec<u8> {
+        use base64::{Engine as _, engine::general_purpose};
+        general_purpose::STANDARD.decode(b64).unwrap()
+    }
+
+    #[test]
+    fn test_credentials_rewrite_java_token_files_byte_for_byte() {
+        for (b64, format) in [
+            (JAVA_WRITABLE_TOKEN_FILE, SerializedFormat::Writable),
+            (JAVA_PROTOBUF_TOKEN_FILE, SerializedFormat::Protobuf),
+        ] {
+            let java_bytes = decode(b64);
+            let credentials = Credentials::from_bytes(&java_bytes).unwrap();
+            assert_eq!(credentials.tokens().len(), 1);
+            assert_eq!(credentials.to_bytes(format), java_bytes, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn test_credentials_round_trip_tokens_and_secret_keys() {
+        let mut credentials = Credentials::new();
+        credentials.add_token(
+            "127.0.0.1:9000",
+            Token::new(
+                vec![1; 300],
+                vec![2; 20],
+                "HDFS_DELEGATION_TOKEN",
+                "127.0.0.1:9000",
+            ),
+        );
+        credentials.add_token(
+            "rm",
+            Token::new(
+                b"id".to_vec(),
+                b"pw".to_vec(),
+                "RM_DELEGATION_TOKEN",
+                "rm:8032",
+            ),
+        );
+        credentials.add_secret_key("secret", vec![7; 129]);
+
+        for format in [SerializedFormat::Writable, SerializedFormat::Protobuf] {
+            let bytes = credentials.to_bytes(format);
+            let read = Credentials::from_bytes(&bytes).unwrap();
+            assert_eq!(read, credentials, "{format:?}");
+            assert_eq!(read.token("rm").unwrap().service(), "rm:8032");
+            assert_eq!(read.secret_key("secret"), Some(&[7u8; 129][..]));
+        }
+
+        let file = NamedTempFile::new().unwrap();
+        credentials
+            .write_token_file(file.path(), SerializedFormat::default())
+            .unwrap();
+        assert_eq!(Token::read_token_file(file.path()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_credentials_replace_entries_with_the_same_alias() {
+        let token = |id: &[u8]| Token::new(id.to_vec(), b"pw".to_vec(), "KIND", "svc");
+        let mut credentials = Credentials::from(vec![token(b"old")]);
+        assert_eq!(credentials.token("svc").unwrap().identifier(), b"old");
+
+        let mut other = Credentials::new();
+        other.add_token("svc", token(b"new"));
+        other.add_secret_key("key", b"value".to_vec());
+        credentials.merge(other);
+
+        assert_eq!(credentials.tokens().len(), 1);
+        assert_eq!(credentials.token("svc").unwrap().identifier(), b"new");
+        assert_eq!(credentials.secret_key("key"), Some(&b"value"[..]));
+        assert!(!format!("{credentials:?}").contains("value"));
+    }
+
+    #[test]
+    fn test_vlong_round_trip() {
+        for value in [
+            0,
+            1,
+            -1,
+            127,
+            128,
+            -112,
+            -113,
+            255,
+            256,
+            65_535,
+            i32::MAX as i64,
+            i32::MIN as i64,
+            1_690_672_432_660,
+            i64::MAX,
+            i64::MIN,
+        ] {
+            let mut buf = Vec::new();
+            write_vlong(&mut buf, value);
+            let mut reader = Bytes::from(buf);
+            assert_eq!(parse_vlong(&mut reader).unwrap(), value);
+            assert!(!reader.has_remaining(), "{value}");
+        }
     }
 }

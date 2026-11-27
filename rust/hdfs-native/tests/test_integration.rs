@@ -6,7 +6,7 @@ mod test {
     use crate::common::{EnvVarGuard, TEST_FILE_INTS, assert_bufs_equal};
     use bytes::{BufMut, Bytes, BytesMut};
     use hdfs_native::{
-        Client, HdfsError, Result, WriteOptions,
+        Client, Credentials, HdfsError, Result, SerializedFormat, Token, WriteOptions,
         acl::{AclEntry, FsAction},
         client::{ClientBuilder, FileStatus},
         minidfs::{DfsFeatures, MiniDfs},
@@ -62,6 +62,51 @@ mod test {
         test_permission_checks(&client, false).await.unwrap();
         test_explicit_keytab_without_default_cache(&dfs).await;
         test_explicit_cache_without_default_cache(&dfs).await;
+        test_delegation_tokens(&client, &dfs.url, "127.0.0.1:9000").await;
+    }
+
+    /// Gets, renews, uses and cancels a delegation token. `client` must use Kerberos.
+    async fn test_delegation_tokens(client: &Client, url: &str, expected_service: &str) {
+        let tokens = client.get_delegation_tokens("hdfs").await.unwrap();
+        assert_eq!(tokens.len(), 1);
+        let token = &tokens[0];
+        assert_eq!(token.kind(), "HDFS_DELEGATION_TOKEN");
+        assert_eq!(token.service(), expected_service);
+
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(client.renew_delegation_token(token).await.unwrap() > now_millis);
+
+        let token_file = "target/test/rust_delegation_token";
+        Credentials::from(tokens.clone())
+            .write_token_file(std::path::Path::new(token_file), SerializedFormat::Writable)
+            .unwrap();
+        {
+            // Without a Kerberos ticket, the client can only authenticate with the token
+            let _cache_guard = EnvVarGuard::set("KRB5CCNAME", "FILE:target/test/nonexistent-cache");
+            let _token_guard = EnvVarGuard::set("HADOOP_TOKEN_FILE_LOCATION", token_file);
+            let token_client = ClientBuilder::new().with_url(url).build().unwrap();
+            test_feature_round_trip(&token_client).await.unwrap();
+
+            client.cancel_delegation_token(token).await.unwrap();
+            let cancelled_client = ClientBuilder::new().with_url(url).build().unwrap();
+            let result = cancelled_client.get_file_info("/").await;
+            assert!(result.is_err(), "{result:?}");
+        }
+        assert!(client.renew_delegation_token(token).await.is_err());
+
+        let other_service = Token::new(
+            token.identifier().to_vec(),
+            token.password().to_vec(),
+            token.kind(),
+            "other:8020",
+        );
+        assert!(matches!(
+            client.renew_delegation_token(&other_service).await,
+            Err(HdfsError::InvalidArgument(_))
+        ));
     }
 
     #[tokio::test]
@@ -354,12 +399,21 @@ mod test {
     async fn test_feature_configuration(features: HashSet<DfsFeatures>) {
         let _ = env_logger::builder().is_test(true).try_init();
         let has_ha = features.contains(&DfsFeatures::HA);
-        let _dfs = MiniDfs::with_features(&features);
+        let dfs = MiniDfs::with_features(&features);
         let client = ClientBuilder::new().build().unwrap();
 
         test_feature_round_trip(&client).await.unwrap();
         if has_ha {
             test_observer_read(&client).await.unwrap();
+        }
+        // Delegation tokens are only issued to clients that authenticated with Kerberos
+        if features.contains(&DfsFeatures::Security) && !features.contains(&DfsFeatures::Token) {
+            let expected_service = if has_ha {
+                "ha-hdfs:minidfs-ns"
+            } else {
+                "127.0.0.1:9000"
+            };
+            test_delegation_tokens(&client, &dfs.url, expected_service).await;
         }
     }
 

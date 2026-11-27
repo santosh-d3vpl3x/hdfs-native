@@ -191,6 +191,7 @@ pub(crate) struct NameServiceProxy {
     failover_max_attempts: u32,
     failover_sleep_base_millis: u64,
     failover_sleep_max_millis: u64,
+    token_service: String,
 }
 
 impl NameServiceProxy {
@@ -228,6 +229,13 @@ impl NameServiceProxy {
             Some(Arc::new(Mutex::new(AlignmentContext::default())))
         } else {
             None
+        };
+
+        // Delegation tokens for a name service are looked up by its logical name, and tokens for
+        // a single NameNode by its address, matching the lookups each ProxyConnection makes.
+        let token_service = match nameservice.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => format!("ha-hdfs:{host}"),
         };
 
         let proxy_connections = if let Some(port) = nameservice.port() {
@@ -278,6 +286,7 @@ impl NameServiceProxy {
                 failover_max_attempts: config.failover_max_attempts(),
                 failover_sleep_base_millis: config.failover_sleep_base_millis(),
                 failover_sleep_max_millis: config.failover_sleep_max_millis(),
+                token_service,
             })
         }
     }
@@ -294,6 +303,11 @@ impl NameServiceProxy {
             }
         }
         Ok(())
+    }
+
+    /// The service name of delegation tokens for this name service.
+    pub(crate) fn token_service(&self) -> &str {
+        &self.token_service
     }
 
     fn is_retriable(exception: &str) -> bool {

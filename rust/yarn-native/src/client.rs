@@ -606,6 +606,14 @@ impl YarnClient {
         Ok(token)
     }
 
+    /// The renewer to name in delegation tokens given to an application, such as HDFS tokens
+    /// in its ApplicationMaster's credentials: the ResourceManager's Kerberos principal, from
+    /// `yarn.resourcemanager.principal`. The ResourceManager renews these tokens while the
+    /// application runs, and rejects a submission with tokens it cannot renew.
+    pub fn delegation_token_renewer(&self) -> Result<String> {
+        self.config.rm_principal()
+    }
+
     /// Extend the lifetime of a ResourceManager delegation token, returning its new expiry
     /// time in milliseconds since the epoch. Only the token's renewer may renew it, and never
     /// beyond its maximum lifetime.

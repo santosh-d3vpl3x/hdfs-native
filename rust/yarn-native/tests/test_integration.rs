@@ -2,7 +2,9 @@
 mod test {
     use std::collections::HashSet;
     use std::future::Future;
-    use std::path::PathBuf;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     use serial_test::serial;
@@ -23,6 +25,156 @@ mod test {
     const TIMEOUT: Duration = Duration::from_secs(60);
     const POLL_INTERVAL: Duration = Duration::from_millis(200);
     const TEST_TAG: &str = "yarn-native-test";
+    /// The ApplicationMaster in tests/bin/application_master.rs
+    const TEST_AM: &str = env!("CARGO_BIN_EXE_yarn-native-test-am");
+
+    fn test_dir() -> PathBuf {
+        std::env::current_dir().unwrap().join("target/test")
+    }
+
+    /// Submits an application whose ApplicationMaster YARN runs from [`TEST_AM`], waits until
+    /// it registers, and connects to the endpoint it registered, as a client of a service
+    /// running in YARN would. The ApplicationMaster starts `workers` containers running
+    /// `worker_command`, giving them `credentials`.
+    async fn start_application_master(
+        client: &YarnClient,
+        name: &str,
+        workers: usize,
+        worker_command: &str,
+        credentials: Credentials,
+    ) -> Result<(ApplicationId, TcpStream)> {
+        let application_id = client.create_application().await?.application_id;
+        let am_log = test_dir().join(format!("{name}-am.log"));
+        let mut am_container = ContainerLaunchContext::default()
+            .commands([TEST_AM, "1>", am_log.to_str().unwrap(), "2>&1"])
+            .env("HADOOP_CONF_DIR", test_dir().to_str().unwrap())
+            .env("RUST_BACKTRACE", "1")
+            .env("YARN_NATIVE_TEST_WORKERS", workers.to_string())
+            .env("YARN_NATIVE_TEST_WORKER_COMMAND", worker_command)
+            .credentials(credentials);
+        for variable in ["HADOOP_OPTS", "JAVA_HOME"] {
+            if let Ok(value) = std::env::var(variable) {
+                am_container = am_container.env(variable, value);
+            }
+        }
+        let mut context = ApplicationSubmissionContext::new(application_id, name);
+        context.am_resource = Resource::new(256, 1);
+        context.am_container = am_container;
+        client.submit_application(context).await?;
+
+        // Clients find the ApplicationMaster's endpoint in the application report
+        let report = wait_for("the ApplicationMaster to register", || async {
+            let report = client.get_application_report(application_id).await.unwrap();
+            assert!(
+                !report.state.is_terminal(),
+                "{name} ended before registering: {}\n{}",
+                report.diagnostics,
+                std::fs::read_to_string(&am_log).unwrap_or_default()
+            );
+            (report.state == ApplicationState::Running && report.rpc_port > 0).then_some(report)
+        })
+        .await;
+        let stream = TcpStream::connect((report.host.as_str(), report.rpc_port as u16))?;
+        let mut greeting = String::new();
+        BufReader::new(&stream).read_line(&mut greeting)?;
+        assert_eq!(greeting.trim(), "yarn-native-test-am");
+        Ok((application_id, stream))
+    }
+
+    /// Tells the ApplicationMaster to stop and checks the application succeeded.
+    async fn stop_application_master(
+        client: &YarnClient,
+        name: &str,
+        application_id: ApplicationId,
+        mut stream: TcpStream,
+    ) -> Result<()> {
+        writeln!(stream, "stop")?;
+        let report = wait_for("the application to finish", || async {
+            client
+                .get_application_report(application_id)
+                .await
+                .ok()
+                .filter(|report| report.state.is_terminal())
+        })
+        .await;
+        assert_eq!(
+            (report.state, report.final_status),
+            (
+                ApplicationState::Finished,
+                FinalApplicationStatus::Succeeded
+            ),
+            "{}\n{}",
+            report.diagnostics,
+            std::fs::read_to_string(test_dir().join(format!("{name}-am.log"))).unwrap_or_default()
+        );
+        Ok(())
+    }
+
+    /// An empty directory for workers to write to, and a command that writes `output` there,
+    /// in a file named after the worker's container.
+    fn worker_output(name: &str, output: &str) -> (PathBuf, String) {
+        let dir = test_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let command = format!("{output} > {}/{{container_id}}", dir.display());
+        (dir, command)
+    }
+
+    fn read_worker_output(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect()
+    }
+
+    async fn test_application_master_in_yarn(client: &YarnClient) -> Result<()> {
+        // A single container: the ApplicationMaster is the whole application
+        let (application_id, stream) =
+            start_application_master(client, "single-container", 0, "", Credentials::new()).await?;
+        stop_application_master(client, "single-container", application_id, stream).await?;
+
+        // A cluster: the ApplicationMaster starts workers
+        let (dir, command) = worker_output("cluster-workers", "echo worker");
+        let (application_id, stream) =
+            start_application_master(client, "cluster", 2, &command, Credentials::new()).await?;
+        stop_application_master(client, "cluster", application_id, stream).await?;
+        assert_eq!(read_worker_output(&dir), vec!["worker\n"; 2]);
+        Ok(())
+    }
+
+    /// A Kerberos client submits an application with an HDFS delegation token that the
+    /// ResourceManager can renew. The ApplicationMaster hands the token to a worker, whose
+    /// Hadoop client reads Kerberized HDFS with it.
+    async fn test_application_master_reads_hdfs(client: &YarnClient) -> Result<()> {
+        let renewer = client.delegation_token_renewer()?;
+        assert!(renewer.starts_with("yarn/localhost@"), "{renewer}");
+
+        let hdfs = hdfs_native::ClientBuilder::new().build().unwrap();
+        let path = "/yarn-native-am-input";
+        let content = "read by a worker of an ApplicationMaster";
+        let mut writer = hdfs
+            .create(path, hdfs_native::WriteOptions::default().overwrite(true))
+            .await
+            .unwrap();
+        writer
+            .write_bytes(bytes::Bytes::from(content))
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        // The ResourceManager renews the tokens and refuses applications whose tokens it can't
+        let credentials = Credentials::from(hdfs.get_delegation_tokens(&renewer).await.unwrap());
+
+        let hadoop = which::which("hadoop").expect("Failed to find hadoop executable");
+        let (dir, command) = worker_output(
+            "secure-workers",
+            &format!("{} fs -cat {path}", hadoop.display()),
+        );
+        let (application_id, stream) =
+            start_application_master(client, "secure", 1, &command, credentials).await?;
+        stop_application_master(client, "secure", application_id, stream).await?;
+        assert_eq!(read_worker_output(&dir), vec![content.to_string()]);
+        Ok(())
+    }
 
     /// Polls `check` until it returns a value, failing the test after [`TIMEOUT`].
     async fn wait_for<T, F, Fut>(what: &str, mut check: F) -> T
@@ -53,6 +205,7 @@ mod test {
             .unwrap();
         test_kill_application(&client).await.unwrap();
         test_unmanaged_application_master(&client).await.unwrap();
+        test_application_master_in_yarn(&client).await.unwrap();
     }
 
     #[tokio::test]
@@ -178,6 +331,10 @@ mod test {
         test_container_reads_hdfs_with_a_delegation_token(&proxy_client)
             .await
             .unwrap();
+
+        // An ApplicationMaster that YARN runs gets its AMRMToken from its token file, so a
+        // Kerberos submitter needs no impersonation
+        test_application_master_reads_hdfs(&client).await.unwrap();
     }
 
     /// An ApplicationMaster gets an HDFS delegation token and hands it to a container, whose

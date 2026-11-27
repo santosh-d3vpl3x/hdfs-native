@@ -195,6 +195,12 @@ impl Credentials {
         }
     }
 
+    /// Removes and returns the token stored under `alias`.
+    pub fn remove_token(&mut self, alias: &str) -> Option<Token> {
+        let index = self.tokens.iter().position(|token| token.alias == alias)?;
+        Some(self.tokens.remove(index))
+    }
+
     /// The token stored under `alias`.
     pub fn token(&self, alias: &str) -> Option<&Token> {
         self.tokens.iter().find(|token| token.alias == alias)
@@ -866,6 +872,12 @@ mod tests {
 
         assert_eq!(credentials.tokens().len(), 1);
         assert_eq!(credentials.token("svc").unwrap().identifier(), b"new");
+        assert_eq!(
+            credentials.remove_token("svc").unwrap().identifier(),
+            b"new"
+        );
+        assert!(credentials.remove_token("svc").is_none());
+        assert!(credentials.tokens().is_empty());
         assert_eq!(credentials.secret_key("key"), Some(&b"value"[..]));
         assert!(!format!("{credentials:?}").contains("value"));
     }

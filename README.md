@@ -162,7 +162,9 @@ The `yarn-native` crate implements the client side of YARN's three RPC protocols
 - [x] ResourceManager HA
 - [x] Kerberos and token authentication
 
-On a Kerberized cluster, the ResourceManager only returns an unmanaged ApplicationMaster's AMRMToken to a caller whose user name equals the application's user, which a Kerberos principal's full name never is. Submit unmanaged applications as an impersonated user (`with_user`), which requires `hadoop.proxyuser.<principal short name>.*` settings on the cluster.
+An ApplicationMaster that YARN runs reads its AMRMToken from the container's token file, so `AmRmClientBuilder` needs no other setup. Give it the delegation tokens it needs, such as HDFS tokens, in its launch context's credentials, with `YarnClient::delegation_token_renewer` as their renewer so the ResourceManager renews them while the application runs.
+
+Unmanaged ApplicationMasters on a Kerberized cluster are the exception: the ResourceManager only returns their AMRMToken to a caller whose user name equals the application's user, which a Kerberos principal's full name never is. Submit them as an impersonated user (`with_user`), which requires `hadoop.proxyuser.<principal short name>.*` settings on the cluster.
 
 ## Building
 

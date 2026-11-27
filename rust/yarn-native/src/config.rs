@@ -35,6 +35,8 @@ const DEFAULT_POLL_INTERVAL_MS: u64 = 200;
 const POLL_TIMEOUT_MS: &str = "yarn.client.application-client-protocol.poll-timeout-ms";
 
 const TOKEN_SERVICE_USE_IP: &str = "hadoop.security.token.service.use_ip";
+const RM_PRINCIPAL: &str = "yarn.resourcemanager.principal";
+const HOST_PATTERN: &str = "_HOST";
 
 /// Retry settings for one kind of server connection. HA clients cycle through every server
 /// before backing off; non-HA clients retry their single server.
@@ -126,6 +128,27 @@ impl Configuration {
         with_default_port(address, default_port)
     }
 
+    /// The ResourceManager's Kerberos principal with `_HOST` replaced by the ResourceManager's
+    /// hostname, like Hadoop's `Master.getMasterPrincipal`. Delegation tokens given to an
+    /// application must name it as their renewer so the ResourceManager can renew them.
+    pub(crate) fn rm_principal(&self) -> Result<String> {
+        let principal = self
+            .get(RM_PRINCIPAL)
+            .map(str::trim)
+            .filter(|principal| !principal.is_empty())
+            .ok_or_else(|| {
+                YarnError::InvalidArgument(format!(
+                    "{RM_PRINCIPAL} is not set, so the ResourceManager's principal is unknown"
+                ))
+            })?;
+        let address = self
+            .rm_addresses(RM_ADDRESS, DEFAULT_RM_PORT)?
+            .into_iter()
+            .next()
+            .expect("rm_addresses returns at least one address");
+        Ok(server_principal(principal, &address))
+    }
+
     /// Builds a token service name for an address, like Hadoop's
     /// `SecurityUtil.buildTokenService`, which uses IP addresses unless
     /// `hadoop.security.token.service.use_ip` is false.
@@ -214,6 +237,33 @@ impl Deref for Configuration {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+/// Replaces a `_HOST` host component in a principal like `yarn/_HOST@REALM` with the host of
+/// `address`, like Hadoop's `SecurityUtil.getServerPrincipal`.
+fn server_principal(principal: &str, address: &str) -> String {
+    let (name, realm) = match principal.split_once('@') {
+        Some((name, realm)) => (name, Some(realm)),
+        None => (principal, None),
+    };
+    let Some((service, HOST_PATTERN)) = name.split_once('/') else {
+        return principal.to_string();
+    };
+    let host = address
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(address)
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let host = if host == "0.0.0.0" {
+        whoami::hostname().unwrap_or_else(|_| "localhost".to_string())
+    } else {
+        host.to_string()
+    };
+    match realm {
+        Some(realm) => format!("{service}/{}@{realm}", host.to_lowercase()),
+        None => format!("{service}/{}", host.to_lowercase()),
     }
 }
 
@@ -387,5 +437,40 @@ mod tests {
             config(&[(POLL_INTERVAL_MS, "soon")]).poll_interval(),
             Duration::from_millis(200)
         );
+    }
+
+    #[test]
+    fn rm_principal_resolves_the_host_pattern() {
+        assert_eq!(
+            config(&[
+                (RM_PRINCIPAL, "yarn/_HOST@EXAMPLE.COM"),
+                (RM_ADDRESS, "RM.example.com:8032"),
+            ])
+            .rm_principal()
+            .unwrap(),
+            "yarn/rm.example.com@EXAMPLE.COM"
+        );
+        assert_eq!(
+            config(&[
+                (RM_PRINCIPAL, "yarn/rm-1@EXAMPLE.COM"),
+                (RM_ADDRESS, "rm-2:8032"),
+            ])
+            .rm_principal()
+            .unwrap(),
+            "yarn/rm-1@EXAMPLE.COM"
+        );
+        assert_eq!(
+            config(&[
+                (RM_PRINCIPAL, "yarn/_HOST"),
+                (RM_HA_ENABLED, "true"),
+                (RM_HA_IDS, "rm1,rm2"),
+                ("yarn.resourcemanager.hostname.rm1", "rm-1"),
+                ("yarn.resourcemanager.hostname.rm2", "rm-2"),
+            ])
+            .rm_principal()
+            .unwrap(),
+            "yarn/rm-1"
+        );
+        assert!(config(&[]).rm_principal().is_err());
     }
 }

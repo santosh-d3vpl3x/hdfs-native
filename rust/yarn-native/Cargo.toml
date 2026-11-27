@@ -18,6 +18,7 @@ roxmltree = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "sync", "time"] }
 url = "2"
+whoami = "2"
 which = { version = "8", optional = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -28,12 +29,18 @@ prost-build = { version = "0.14", optional = true }
 protobuf-src = { version = "2", optional = true }
 
 [dev-dependencies]
-bytes = { workspace = true }
 env_logger = { workspace = true }
 hdfs-native = { path = "../hdfs-native" }
 serial_test = "4"
-whoami = "2"
 tokio = { workspace = true, features = ["macros"] }
+
+[[bin]]
+# A minimal ApplicationMaster that the integration tests have YARN launch
+name = "yarn-native-test-am"
+path = "tests/bin/application_master.rs"
+required-features = ["integration-test"]
+test = false
+doc = false
 
 [features]
 generate-protobuf = ["prost-build", "protobuf-src", "hadoop-native/generate-protobuf"]

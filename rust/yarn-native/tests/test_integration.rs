@@ -266,7 +266,7 @@ mod test {
             .status()
             .unwrap();
         assert!(status.success(), "Failed to create the archive");
-        let archive = upload_resource(
+        let mut archive = upload_resource(
             &hdfs,
             &archive,
             "/yarn-native-staging/am.tgz",
@@ -274,6 +274,9 @@ mod test {
             LocalResourceVisibility::Application,
         )
         .await;
+        // Refer to it on the default filesystem, without a host or port, as an HA nameservice
+        // path also has no port. Java must not see port 0.
+        archive.url = "hdfs:///yarn-native-staging/am.tgz".parse().unwrap();
 
         let (dir, worker_command) = read_hdfs_command("secure-workers", path);
         run_application_master(
@@ -419,16 +422,37 @@ mod test {
             .await
             .unwrap();
 
-        // The request reaches the ResourceManager, which then loses it
+        // Two containers arrive before the disruption, so the client must not ask for them
+        // again when it resyncs
+        let mut asks = vec![ResourceRequest::new(0, Resource::new(128, 1), 2)];
+        let mut before = Vec::new();
+        let start = Instant::now();
+        while before.len() < 2 {
+            assert!(start.elapsed() < TIMEOUT, "Timed out allocating");
+            let response = am
+                .allocate(AllocateRequest {
+                    asks: std::mem::take(&mut asks),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            before.extend(response.allocated_containers);
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        assert_eq!(before.len(), 2);
+
+        // This request reaches the ResourceManager, which then loses it
+        let mut late = ResourceRequest::new(0, Resource::new(128, 1), 1);
+        late.allocation_request_id = Some(7);
         let response = am
             .allocate(AllocateRequest {
-                asks: vec![ResourceRequest::new(0, Resource::new(128, 1), 1)],
+                asks: vec![late],
                 ..Default::default()
             })
             .await
             .unwrap();
         assert!(!response.resynced);
-        let mut containers = response.allocated_containers;
+        let mut after = response.allocated_containers;
 
         disrupt();
 
@@ -453,12 +477,12 @@ mod test {
         );
 
         // The first heartbeat finds the ResourceManager has lost the ApplicationMaster, so the
-        // client registers again and re-sends the outstanding request
+        // client registers again and re-sends only the outstanding request
         let response = am.allocate(AllocateRequest::default()).await.unwrap();
         assert!(response.resynced);
-        containers.extend(response.allocated_containers);
+        after.extend(response.allocated_containers);
         let start = Instant::now();
-        while containers.is_empty() {
+        while after.is_empty() {
             assert!(
                 start.elapsed() < TIMEOUT,
                 "Timed out allocating after a resync"
@@ -466,9 +490,21 @@ mod test {
             tokio::time::sleep(POLL_INTERVAL).await;
             let response = am.allocate(AllocateRequest::default()).await.unwrap();
             assert!(!response.resynced);
-            containers.extend(response.allocated_containers);
+            after.extend(response.allocated_containers);
         }
-        assert_eq!(containers.len(), 1);
+        // Keep heartbeating long enough for the NodeManager to offer duplicates, if any were
+        // requested
+        for _ in 0..10 {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            after.extend(
+                am.allocate(AllocateRequest::default())
+                    .await
+                    .unwrap()
+                    .allocated_containers,
+            );
+        }
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert_eq!(after[0].allocation_request_id, Some(7));
 
         am.unregister_application_master(FinalApplicationStatus::Succeeded, None, None)
             .await

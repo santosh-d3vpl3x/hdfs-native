@@ -436,7 +436,10 @@ impl FromStr for ResourceUrl {
         };
         Ok(Self {
             scheme: url.scheme().to_string(),
-            host: url.host_str().map(str::to_string),
+            host: url
+                .host_str()
+                .filter(|host| !host.is_empty())
+                .map(str::to_string),
             port: url.port().map(i32::from),
             file: url.path().to_string(),
             user_info,
@@ -461,12 +464,15 @@ impl fmt::Display for ResourceUrl {
     }
 }
 
+/// Java's `URL.fromURI` stores `java.net.URI`'s "no port" value, -1.
+const NO_PORT: i32 = -1;
+
 impl From<UrlProto> for ResourceUrl {
     fn from(value: UrlProto) -> Self {
         Self {
             scheme: value.scheme.unwrap_or_default(),
-            host: value.host,
-            port: value.port,
+            host: value.host.filter(|host| !host.is_empty()),
+            port: value.port.filter(|port| *port > 0),
             file: value.file.unwrap_or_default(),
             user_info: value.user_info,
         }
@@ -478,7 +484,9 @@ impl From<ResourceUrl> for UrlProto {
         Self {
             scheme: Some(value.scheme),
             host: value.host,
-            port: value.port,
+            // The proto's default port is 0, which Java's `URL.toPath` would write into the URI
+            // as `host:0`. Send Java's "no port" value instead, as `URL.fromURI` does.
+            port: Some(value.port.unwrap_or(NO_PORT)),
             file: Some(value.file),
             user_info: value.user_info,
         }
@@ -810,6 +818,31 @@ mod tests {
         assert_eq!(url.port, Some(8020));
         assert_eq!(url.file, "/apps/app.jar");
         assert!("not a url".parse::<ResourceUrl>().is_err());
+    }
+
+    #[test]
+    fn test_portless_resource_urls_match_java() {
+        // An HA nameservice has no port. Java must get -1, not the proto default 0, or its
+        // URL.toPath produces hdfs://nameservice:0/...
+        let url: ResourceUrl = "hdfs://nameservice/apps/app.tgz".parse().unwrap();
+        assert_eq!(url.port, None);
+        assert_eq!(UrlProto::from(url.clone()).port, Some(-1));
+
+        // Java sends -1 for a missing port
+        let from_java = ResourceUrl::from(UrlProto {
+            scheme: Some("hdfs".to_string()),
+            host: Some("nameservice".to_string()),
+            port: Some(-1),
+            file: Some("/apps/app.tgz".to_string()),
+            user_info: None,
+        });
+        assert_eq!(from_java, url);
+        assert_eq!(from_java.to_string(), "hdfs://nameservice/apps/app.tgz");
+
+        // A path on the default filesystem has no host
+        let default_fs: ResourceUrl = "hdfs:///apps/app.tgz".parse().unwrap();
+        assert_eq!(default_fs.host, None);
+        assert_eq!(default_fs.file, "/apps/app.tgz");
     }
 
     #[test]
